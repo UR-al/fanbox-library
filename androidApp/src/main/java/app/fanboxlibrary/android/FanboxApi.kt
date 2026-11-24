@@ -369,7 +369,10 @@ internal object FanboxClient {
     suspend fun fetchCreatorPlans(context: Context, creatorId: String): FanboxResult<List<FanboxPlan>> {
         val encoded = URLEncoder.encode(creatorId, "UTF-8")
         return requestJson(context, "${FanboxSession.API_BASE}/plan.listCreator?creatorId=$encoded") { root ->
-            val arr = root.optJSONArray("body") ?: JSONArray()
+            val arr = root.optJSONArray("body")
+                ?: root.optJSONObject("body")?.optJSONArray("plans")
+                ?: root.optJSONObject("body")?.optJSONArray("items")
+                ?: JSONArray()
             buildList {
                 for (i in 0 until arr.length()) {
                     val obj = arr.optJSONObject(i) ?: continue
@@ -444,7 +447,10 @@ internal object FanboxClient {
 
     suspend fun fetchCreators(context: Context): FanboxResult<List<FanboxCreator>> {
         val supportingRes = requestJson(context, "${FanboxSession.API_BASE}/plan.listSupporting") { root ->
-            val arr = root.optJSONArray("body") ?: JSONArray()
+            val arr = root.optJSONArray("body")
+                ?: root.optJSONObject("body")?.optJSONArray("plans")
+                ?: root.optJSONObject("body")?.optJSONArray("items")
+                ?: JSONArray()
             buildList {
                 for (i in 0 until arr.length()) {
                     val obj = arr.optJSONObject(i) ?: continue
@@ -471,7 +477,10 @@ internal object FanboxClient {
         }
 
         val followingRes = requestJson(context, "${FanboxSession.API_BASE}/creator.listFollowing") { root ->
-            val arr = root.optJSONArray("body") ?: JSONArray()
+            val arr = root.optJSONArray("body")
+                ?: root.optJSONObject("body")?.optJSONArray("creators")
+                ?: root.optJSONObject("body")?.optJSONArray("items")
+                ?: JSONArray()
             buildList {
                 for (i in 0 until arr.length()) {
                     val obj = arr.optJSONObject(i) ?: continue
@@ -501,7 +510,8 @@ internal object FanboxClient {
         return requestJson(context, url) { root ->
             val bodyObj = root.optJSONObject("body")
                 ?: throw IOException("게시글 정보를 불러올 수 없습니다.")
-            parsePostDetail(bodyObj)
+            val postObj = bodyObj.optJSONObject("post") ?: bodyObj
+            parsePostDetail(postObj)
         }
     }
 
@@ -637,6 +647,7 @@ internal object FanboxClient {
     private fun parseFeedPage(root: JSONObject): FanboxFeedPage {
         val bodyObj = root.optJSONObject("body")
         val itemsArr = bodyObj?.optJSONArray("items")
+            ?: bodyObj?.optJSONArray("posts")
             ?: root.optJSONArray("body")
             ?: JSONArray()
         val nextUrl = bodyObj?.optNullableString("nextUrl")

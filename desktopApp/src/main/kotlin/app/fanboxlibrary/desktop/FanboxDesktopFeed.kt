@@ -562,62 +562,132 @@ private fun DesktopFanboxLoginDialog(
     val colors = LocalGalleryColors.current
     val scope = rememberCoroutineScope()
     var input by remember { mutableStateOf(DesktopFanboxSession.rawCookie()) }
-    var testing by remember { mutableStateOf(false) }
+    var showManual by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("") }
+    var loginJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+
+    DisposableEffect(Unit) {
+        onDispose { loginJob?.cancel() }
+    }
 
     AlertDialog(
-        onDismissRequest = { if (!testing) onDismiss() },
+        onDismissRequest = {
+            loginJob?.cancel()
+            onDismiss()
+        },
         containerColor = colors.surface,
         titleContentColor = colors.ink,
         textContentColor = colors.ink,
-        title = { Text("FANBOX 세션 연결 (PC)", style = MaterialTheme.typography.titleLarge) },
+        title = { Text("FANBOX 로그인 (PC)", style = MaterialTheme.typography.titleLarge) },
         text = {
-            Column(Modifier.widthIn(min = 440.dp, max = 520.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(Modifier.widthIn(min = 440.dp, max = 520.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(
-                    "1. 브라우저에서 FANBOX에 로그인한 뒤 F12(개발자 도구) → Application → Cookies → https://www.fanbox.cc 에서 FANBOXSESSID 값을 복사하세요.\n2. 아래 칸에 붙여 넣고 ‘연결 확인’을 누르면 PC 보관함에 안전하게 저장됩니다.",
+                    "모바일과 똑같이 전용 로그인 창이 열립니다. pixiv/FANBOX에 로그인하면 자동으로 연결되고 창이 닫힙니다.",
                     style = MaterialTheme.typography.bodySmall,
                     color = colors.muted,
                 )
-                OutlinedButton(onClick = onOpenBrowser, shape = RoundedCornerShape(9.dp)) {
-                    Icon(Icons.AutoMirrored.Rounded.OpenInNew, null, Modifier.size(16.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text("브라우저에서 FANBOX 열기")
-                }
-                OutlinedTextField(
-                    value = input,
-                    onValueChange = { input = it },
-                    label = { Text("FANBOXSESSID 값 (또는 전체 Cookie 문자열)") },
-                    singleLine = true,
+
+                Button(
+                    enabled = !busy,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(10.dp),
-                )
+                    onClick = {
+                        busy = true
+                        status = "로그인 창을 준비하는 중…"
+                        loginJob = scope.launch {
+                            val result = DesktopWebLogin.runPopupLogin { msg -> status = msg }
+                            result.onSuccess {
+                                status = "세션을 검증하는 중…"
+                                val check = withContext(Dispatchers.IO) { DesktopFanboxClient.fetchHomeFeed() }
+                                when (check) {
+                                    is DesktopFanboxResult.Success -> onSaved()
+                                    is DesktopFanboxResult.AuthRequired -> status = "로그인 세션 검증에 실패했습니다. 다시 시도해 주세요."
+                                    is DesktopFanboxResult.Error -> {
+                                        // Even if feed check temporarily failed, cookie is saved
+                                        onSaved()
+                                    }
+                                }
+                            }.onFailure { err ->
+                                if (err !is kotlinx.coroutines.CancellationException) {
+                                    status = err.localizedMessage ?: "웹 로그인 실패"
+                                }
+                            }
+                            busy = false
+                        }
+                    },
+                ) {
+                    Icon(Icons.AutoMirrored.Rounded.Login, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(if (busy) "로그인 대기 중…" else "웹 창으로 간편 로그인")
+                }
+
+                if (busy) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth(), color = colors.accent)
+                }
+
                 if (status.isNotBlank()) {
                     Text(status, style = MaterialTheme.typography.bodySmall, color = colors.accent)
+                }
+
+                HorizontalDivider(color = colors.border)
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().clickable { showManual = !showManual }.padding(vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        if (showManual) "▴ 쿠키 직접 붙여넣기 접기" else "▾ 또는 FANBOXSESSID 쿠키 직접 붙여넣기",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = colors.muted,
+                    )
+                }
+
+                if (showManual) {
+                    OutlinedTextField(
+                        value = input,
+                        onValueChange = { input = it },
+                        label = { Text("FANBOXSESSID 값 (또는 전체 Cookie)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp),
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = onOpenBrowser, shape = RoundedCornerShape(9.dp)) {
+                            Icon(Icons.AutoMirrored.Rounded.OpenInNew, null, Modifier.size(15.dp))
+                            Spacer(Modifier.width(5.dp))
+                            Text("브라우저 열기")
+                        }
+                        Button(
+                            enabled = input.isNotBlank() && !busy,
+                            shape = RoundedCornerShape(9.dp),
+                            onClick = {
+                                busy = true
+                                status = "쿠키를 확인하는 중…"
+                                scope.launch {
+                                    DesktopFanboxSession.saveSessionInput(input)
+                                    val check = withContext(Dispatchers.IO) { DesktopFanboxClient.fetchHomeFeed() }
+                                    when (check) {
+                                        is DesktopFanboxResult.Success -> onSaved()
+                                        is DesktopFanboxResult.AuthRequired -> status = "유효하지 않은 FANBOXSESSID입니다."
+                                        is DesktopFanboxResult.Error -> status = check.message
+                                    }
+                                    busy = false
+                                }
+                            },
+                        ) { Text("쿠키 저장") }
+                    }
                 }
             }
         },
         confirmButton = {
-            Button(
-                enabled = input.isNotBlank() && !testing,
+            TextButton(
                 onClick = {
-                    testing = true
-                    status = "세션을 확인하는 중…"
-                    scope.launch {
-                        DesktopFanboxSession.saveSessionInput(input)
-                        val check = withContext(Dispatchers.IO) { DesktopFanboxClient.fetchHomeFeed() }
-                        when (check) {
-                            is DesktopFanboxResult.Success -> onSaved()
-                            is DesktopFanboxResult.AuthRequired -> status = "로그인 세션이 유효하지 않습니다. FANBOXSESSID 값을 다시 확인해 주세요."
-                            is DesktopFanboxResult.Error -> status = check.message
-                        }
-                        testing = false
-                    }
+                    loginJob?.cancel()
+                    onDismiss()
                 },
-            ) {
-                Text(if (testing) "확인 중…" else "연결 확인 및 저장")
-            }
+            ) { Text("닫기") }
         },
-        dismissButton = { TextButton(onClick = onDismiss, enabled = !testing) { Text("취소") } },
     )
 }
 

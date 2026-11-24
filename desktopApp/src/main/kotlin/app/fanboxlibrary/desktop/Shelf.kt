@@ -1,90 +1,466 @@
 package app.fanboxlibrary.desktop
 
 import androidx.compose.foundation.*
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.*
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Collections
+import androidx.compose.material.icons.rounded.FolderZip
+import androidx.compose.material.icons.rounded.GridView
+import androidx.compose.material.icons.rounded.Image
+import androidx.compose.material.icons.rounded.PhotoLibrary
+import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.automirrored.rounded.Sort
+import androidx.compose.material.icons.rounded.ViewAgenda
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import app.fanboxlibrary.shared.LibraryPost
 import java.io.File
+import kotlin.math.abs
 
 internal fun LibraryPost.artistLabel() = creator.ifBlank { "작가 미분류" }
 internal fun LibraryPost.yearLabel() = year?.toString() ?: "연도 미상"
 internal fun LibraryPost.titleLabel() = title.ifBlank { "제목 없는 작품" }
+internal fun LibraryPost.hasTextless() = assets.any { it.isImage && it.variant.equals("textless", ignoreCase = true) }
+internal fun LibraryPost.attachmentCount() = assets.count { !it.isImage }
+internal fun LibraryPost.imageCount() = assets.count { it.isImage }
+
+internal enum class SmartFilter(val label: String) {
+    ALL("전체 보관함"),
+    TEXTLESS("Textless 보유작"),
+    ATTACHMENTS("PSD · ZIP 포함"),
+}
+
+internal enum class SortMode(val label: String) {
+    YEAR_DESC("최신 연도순"),
+    TITLE_ASC("제목순"),
+    ASSETS_DESC("파일 많은 순"),
+}
+
+internal fun computeVisiblePosts(
+    posts: List<LibraryPost>,
+    smartFilter: SmartFilter,
+    creator: String?,
+    year: String?,
+    query: String,
+    sortMode: SortMode,
+): List<LibraryPost> {
+    val bySmart = when (smartFilter) {
+        SmartFilter.ALL -> posts
+        SmartFilter.TEXTLESS -> posts.filter { it.hasTextless() }
+        SmartFilter.ATTACHMENTS -> posts.filter { it.attachmentCount() > 0 }
+    }
+    val groups = bySmart.groupingBy { it.artistLabel() }.eachCount()
+    val activeArtist = creator?.takeIf { it in groups }
+    val byArtist = if (activeArtist == null) bySmart else bySmart.filter { it.artistLabel() == activeArtist }
+    val validYears = byArtist.map { it.yearLabel() }.toSet()
+    val activeYear = year?.takeIf { it in validYears }
+    val term = query.trim()
+
+    val filtered = byArtist.filter { p ->
+        (activeYear == null || p.yearLabel() == activeYear) &&
+            (term.isEmpty() ||
+                p.title.contains(term, true) ||
+                p.creator.contains(term, true) ||
+                p.sourceUrl.contains(term, true) ||
+                p.assets.any { it.name.contains(term, true) })
+    }
+
+    return when (sortMode) {
+        SortMode.YEAR_DESC -> filtered.sortedWith(
+            compareByDescending<LibraryPost> { it.year ?: 0 }
+                .thenByDescending { it.title }
+                .thenBy { it.id },
+        )
+        SortMode.TITLE_ASC -> filtered.sortedWith(
+            compareBy<LibraryPost> { it.titleLabel().lowercase() }
+                .thenByDescending { it.year ?: 0 },
+        )
+        SortMode.ASSETS_DESC -> filtered.sortedWith(
+            compareByDescending<LibraryPost> { it.assets.size }
+                .thenByDescending { it.year ?: 0 }
+                .thenBy { it.titleLabel().lowercase() },
+        )
+    }
+}
+
+private val AvatarPalette = listOf(
+    Color(0xFFFF5C7C),
+    Color(0xFF6366F1),
+    Color(0xFF10B981),
+    Color(0xFFF59E0B),
+    Color(0xFF06B6D4),
+    Color(0xFFEC4899),
+    Color(0xFF8B5CF6),
+)
+
+private fun artistColor(name: String): Color = AvatarPalette[abs(name.hashCode()) % AvatarPalette.size]
 
 @Composable
 internal fun Shelf(
-    posts: List<LibraryPost>, query: String, onQuery: (String) -> Unit,
-    creator: String?, onCreator: (String?) -> Unit, year: String?, onYear: (String?) -> Unit,
-    onPost: (String) -> Unit, onBrowse: () -> Unit
+    posts: List<LibraryPost>,
+    visiblePosts: List<LibraryPost>,
+    query: String,
+    onQuery: (String) -> Unit,
+    smartFilter: SmartFilter,
+    onSmartFilter: (SmartFilter) -> Unit,
+    creator: String?,
+    onCreator: (String?) -> Unit,
+    year: String?,
+    onYear: (String?) -> Unit,
+    sortMode: SortMode,
+    onSortMode: (SortMode) -> Unit,
+    largeGrid: Boolean,
+    onToggleGrid: () -> Unit,
+    onPost: (String) -> Unit,
+    onBrowse: () -> Unit,
+    onLinkFolder: () -> Unit,
 ) {
-    val groups = remember(posts) { posts.groupingBy { it.artistLabel() }.eachCount().toSortedMap() }
-    val artist = creator?.takeIf { it in groups }
-    val byArtist = remember(posts, artist) { if (artist == null) posts else posts.filter { it.artistLabel() == artist } }
-    val years = remember(byArtist) { byArtist.map { it.yearLabel() }.distinct().sortedByDescending { it.toIntOrNull() ?: 0 } }
-    val selectedYear = year?.takeIf { it in years }
-    val filtered = remember(byArtist, query, selectedYear) {
-        val term = query.trim()
-        byArtist.filter { p -> (selectedYear == null || p.yearLabel() == selectedYear) &&
-            (term.isEmpty() || p.title.contains(term, true) || p.creator.contains(term, true) ||
-                p.sourceUrl.contains(term, true) || p.assets.any { it.name.contains(term, true) }) }
-            .sortedWith(compareByDescending<LibraryPost> { it.year ?: 0 }.thenByDescending { it.title }.thenBy { it.id })
+    val colors = LocalGalleryColors.current
+    val textlessCount = remember(posts) { posts.count { it.hasTextless() } }
+    val attachPostCount = remember(posts) { posts.count { it.attachmentCount() > 0 } }
+    val totalImages = remember(posts) { posts.sumOf { it.imageCount() } }
+    val totalAttachments = remember(posts) { posts.sumOf { it.attachmentCount() } }
+
+    val bySmart = remember(posts, smartFilter) {
+        when (smartFilter) {
+            SmartFilter.ALL -> posts
+            SmartFilter.TEXTLESS -> posts.filter { it.hasTextless() }
+            SmartFilter.ATTACHMENTS -> posts.filter { it.attachmentCount() > 0 }
+        }
     }
+    val groups = remember(bySmart) { bySmart.groupingBy { it.artistLabel() }.eachCount().toSortedMap() }
+    val activeArtist = creator?.takeIf { it in groups }
+    val byArtist = remember(bySmart, activeArtist) {
+        if (activeArtist == null) bySmart else bySmart.filter { it.artistLabel() == activeArtist }
+    }
+    val years = remember(byArtist) {
+        byArtist.map { it.yearLabel() }.distinct().sortedByDescending { it.toIntOrNull() ?: 0 }
+    }
+    val selectedYear = year?.takeIf { it in years }
+    var sortMenuOpen by remember { mutableStateOf(false) }
+
     Row(Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxHeight().width(166.dp).background(Color(0xFFF0EEEB)).padding(12.dp)) {
-            Text("작가", Modifier.padding(start = 7.dp, top = 8.dp, bottom = 10.dp), style = MaterialTheme.typography.subtitle2, color = muted)
-            SideItem("전체 작품", posts.size, artist == null) { onCreator(null) }
+        // Left Sidebar
+        Column(
+            modifier = Modifier
+                .fillMaxHeight()
+                .width(232.dp)
+                .background(colors.sidebar)
+                .padding(14.dp),
+        ) {
+            Text(
+                "라이브러리",
+                style = MaterialTheme.typography.labelMedium,
+                color = colors.muted,
+                modifier = Modifier.padding(start = 10.dp, top = 4.dp, bottom = 8.dp),
+            )
+            SmartNavItem(
+                icon = Icons.Rounded.Collections,
+                label = SmartFilter.ALL.label,
+                count = posts.size,
+                selected = smartFilter == SmartFilter.ALL && activeArtist == null,
+                tint = colors.accent,
+                onClick = { onSmartFilter(SmartFilter.ALL); onCreator(null) },
+            )
+            Spacer(Modifier.height(3.dp))
+            SmartNavItem(
+                icon = Icons.Rounded.AutoAwesome,
+                label = SmartFilter.TEXTLESS.label,
+                count = textlessCount,
+                selected = smartFilter == SmartFilter.TEXTLESS && activeArtist == null,
+                tint = colors.emerald,
+                onClick = { onSmartFilter(SmartFilter.TEXTLESS); onCreator(null) },
+            )
+            Spacer(Modifier.height(3.dp))
+            SmartNavItem(
+                icon = Icons.Rounded.FolderZip,
+                label = SmartFilter.ATTACHMENTS.label,
+                count = attachPostCount,
+                selected = smartFilter == SmartFilter.ATTACHMENTS && activeArtist == null,
+                tint = colors.secondary,
+                onClick = { onSmartFilter(SmartFilter.ATTACHMENTS); onCreator(null) },
+            )
+
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider(color = colors.border)
+            Spacer(Modifier.height(12.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("작가", style = MaterialTheme.typography.labelMedium, color = colors.muted, modifier = Modifier.weight(1f))
+                Text("${groups.size}", style = MaterialTheme.typography.labelSmall, color = colors.muted)
+            }
             Spacer(Modifier.height(4.dp))
-            LazyColumn {
+
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
                 items(groups.keys.toList(), key = { it }) { name ->
-                    SideItem(name, groups.getValue(name), artist == name) { onCreator(name) }
+                    ArtistSideItem(
+                        name = name,
+                        count = groups.getValue(name),
+                        selected = activeArtist == name,
+                        onClick = { onCreator(if (activeArtist == name) null else name) },
+                    )
                 }
+            }
+
+            Spacer(Modifier.height(12.dp))
+            // Bottom library stats summary
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(colors.surface)
+                    .border(1.dp, colors.border, RoundedCornerShape(12.dp))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text("보관함 요약", style = MaterialTheme.typography.labelMedium, color = colors.muted)
+                Text(
+                    "작품 ${posts.size}개 · 이미지 ${totalImages}장",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = colors.ink,
+                )
+                Text(
+                    "Textless ${textlessCount}작 · 첨부 ${totalAttachments}개",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = colors.muted,
+                )
             }
         }
-        Column(Modifier.weight(1f).fillMaxHeight().padding(horizontal = 22.dp, vertical = 16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+
+        // Sidebar vertical hairline divider
+        Box(Modifier.fillMaxHeight().width(1.dp).background(colors.border))
+
+        // Main Gallery Area
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                .background(colors.bg)
+                .padding(horizontal = 24.dp, vertical = 18.dp),
+        ) {
+            // Header row
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
                 Column(Modifier.weight(1f)) {
-                    Text(artist ?: "전체 작품", style = MaterialTheme.typography.h5, color = ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text("작품 ${filtered.size}개", style = MaterialTheme.typography.caption, color = muted)
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(
+                            activeArtist ?: smartFilter.label,
+                            style = MaterialTheme.typography.headlineSmall,
+                            color = colors.ink,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(20.dp))
+                                .background(colors.accentSoft)
+                                .padding(horizontal = 10.dp, vertical = 3.dp),
+                        ) {
+                            Text(
+                                "${visiblePosts.size}개",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = colors.accent,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                    }
+                    if (activeArtist != null && smartFilter != SmartFilter.ALL) {
+                        Text(
+                            "필터: ${smartFilter.label}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = colors.muted,
+                        )
+                    }
                 }
-                OutlinedTextField(query, onQuery, label = { Text("작품·작가·파일 검색") }, singleLine = true, modifier = Modifier.width(210.dp))
+
+                // Compact Pill Search Bar
+                Row(
+                    modifier = Modifier
+                        .width(246.dp)
+                        .height(38.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(colors.surface)
+                        .border(1.dp, colors.border, RoundedCornerShape(10.dp))
+                        .padding(horizontal = 11.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Icon(Icons.Rounded.Search, null, tint = colors.muted, modifier = Modifier.size(16.dp))
+                    Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                        if (query.isEmpty()) {
+                            Text(
+                                "작품 · 작가 · 파일 검색…",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = colors.muted,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        BasicTextField(
+                            value = query,
+                            onValueChange = onQuery,
+                            singleLine = true,
+                            textStyle = MaterialTheme.typography.bodySmall.copy(color = colors.ink),
+                            cursorBrush = SolidColor(colors.accent),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                    if (query.isNotEmpty()) {
+                        Icon(
+                            Icons.Rounded.Close,
+                            contentDescription = "검색어 지우기",
+                            tint = colors.muted,
+                            modifier = Modifier.size(15.dp).clickable { onQuery("") },
+                        )
+                    }
+                }
+
+                // Sort Dropdown
+                Box {
+                    OutlinedButton(
+                        onClick = { sortMenuOpen = true },
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, colors.border),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
+                        Icon(Icons.AutoMirrored.Rounded.Sort, contentDescription = null, modifier = Modifier.size(16.dp), tint = colors.muted)
+                        Spacer(Modifier.width(6.dp))
+                        Text(sortMode.label, style = MaterialTheme.typography.labelLarge, color = colors.ink)
+                    }
+                    DropdownMenu(
+                        expanded = sortMenuOpen,
+                        onDismissRequest = { sortMenuOpen = false },
+                        containerColor = colors.surface,
+                    ) {
+                        SortMode.entries.forEach { mode ->
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        mode.label,
+                                        color = if (mode == sortMode) colors.accent else colors.ink,
+                                        fontWeight = if (mode == sortMode) FontWeight.SemiBold else FontWeight.Normal,
+                                    )
+                                },
+                                onClick = { onSortMode(mode); sortMenuOpen = false },
+                            )
+                        }
+                    }
+                }
+
+                // Grid Size Toggle
+                OutlinedIconButton(
+                    onClick = onToggleGrid,
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, colors.border),
+                ) {
+                    Icon(
+                        if (largeGrid) Icons.Rounded.GridView else Icons.Rounded.ViewAgenda,
+                        contentDescription = if (largeGrid) "보통 카드 크기" else "큰 카드 크기",
+                        tint = colors.muted,
+                        modifier = Modifier.size(18.dp),
+                    )
+                }
             }
+
+            // Year Filter Chips
             if (years.isNotEmpty()) {
-                Row(Modifier.horizontalScroll(rememberScrollState()).padding(top = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(top = 12.dp, bottom = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
                     ShelfFilter("전체 연도", selectedYear == null) { onYear(null) }
                     years.forEach { y -> ShelfFilter(y, selectedYear == y) { onYear(y) } }
                 }
             }
-            Spacer(Modifier.height(12.dp))
-            if (filtered.isEmpty()) {
+
+            Spacer(Modifier.height(14.dp))
+
+            if (visiblePosts.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(if (posts.isEmpty()) "보관한 작품이 없습니다" else "조건에 맞는 작품이 없습니다",
-                            style = MaterialTheme.typography.h6, color = ink)
-                        Spacer(Modifier.height(8.dp))
-                        Text(if (posts.isEmpty()) "기존 작가 폴더를 연결하거나 저장한 파일을 가져오세요." else "다른 검색어나 연도를 선택해 보세요.",
-                            style = MaterialTheme.typography.body2, color = muted)
-                        if (posts.isEmpty()) TextButton(onClick = onBrowse) { Text("FANBOX에서 작품 열기") }
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(colors.surface)
+                            .border(1.dp, colors.border, RoundedCornerShape(18.dp))
+                            .padding(horizontal = 36.dp, vertical = 32.dp),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(56.dp)
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(colors.accentSoft),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Icon(Icons.Rounded.PhotoLibrary, null, tint = colors.accent, modifier = Modifier.size(28.dp))
+                        }
+                        Text(
+                            if (posts.isEmpty()) "보관한 작품이 없습니다" else "조건에 맞는 작품이 없습니다",
+                            style = MaterialTheme.typography.titleLarge,
+                            color = colors.ink,
+                        )
+                        Text(
+                            if (posts.isEmpty()) "기존 작가 폴더를 연결하거나 파일을 창으로 드래그해서 추가하세요."
+                            else "다른 검색어, 작가, 또는 연도 필터를 선택해 보세요.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = colors.muted,
+                        )
+                        if (posts.isEmpty()) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.padding(top = 6.dp)) {
+                                Button(onClick = onLinkFolder) { Text("작가 폴더 연결") }
+                                OutlinedButton(onClick = onBrowse) { Text("FANBOX에서 작품 열기") }
+                            }
+                        }
                     }
                 }
             } else {
-                LazyVerticalGrid(columns = GridCells.Adaptive(170.dp), verticalArrangement = Arrangement.spacedBy(18.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(bottom = 20.dp)) {
-                    items(filtered, key = { it.id }) { post -> Cover(post) { onPost(post.id) } }
+                LazyVerticalGrid(
+                    columns = GridCells.Adaptive(if (largeGrid) 248.dp else 192.dp),
+                    verticalArrangement = Arrangement.spacedBy(18.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    contentPadding = PaddingValues(bottom = 28.dp),
+                ) {
+                    items(visiblePosts, key = { it.id }) { post ->
+                        CoverCard(post) { onPost(post.id) }
+                    }
                 }
             }
         }
@@ -92,41 +468,283 @@ internal fun Shelf(
 }
 
 @Composable
-private fun SideItem(label: String, count: Int, selected: Boolean, onClick: () -> Unit) {
-    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(7.dp))
-        .background(if (selected) Color(0xFFE1D7EA) else Color.Transparent)
-        .clickable(onClick = onClick).padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text(label, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis,
-            color = if (selected) violet else ink, fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal)
-        Text(count.toString(), style = MaterialTheme.typography.caption, color = muted)
+private fun SmartNavItem(
+    icon: ImageVector,
+    label: String,
+    count: Int,
+    selected: Boolean,
+    tint: Color,
+    onClick: () -> Unit,
+) {
+    val colors = LocalGalleryColors.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (selected) colors.surfaceElevated else Color.Transparent)
+            .border(
+                width = 1.dp,
+                color = if (selected) colors.borderStrong else Color.Transparent,
+                shape = RoundedCornerShape(10.dp),
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(9.dp),
+    ) {
+        Icon(icon, contentDescription = null, tint = if (selected) tint else colors.muted, modifier = Modifier.size(18.dp))
+        Text(
+            label,
+            modifier = Modifier.weight(1f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (selected) colors.ink else colors.muted,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+        )
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(12.dp))
+                .background(if (selected) tint.copy(alpha = 0.2f) else colors.surface)
+                .padding(horizontal = 7.dp, vertical = 2.dp),
+        ) {
+            Text(
+                count.toString(),
+                style = MaterialTheme.typography.labelSmall,
+                color = if (selected) tint else colors.muted,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ArtistSideItem(name: String, count: Int, selected: Boolean, onClick: () -> Unit) {
+    val colors = LocalGalleryColors.current
+    val avatarColor = remember(name) { artistColor(name) }
+    val initial = remember(name) { name.trim().firstOrNull()?.uppercase() ?: "?" }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (selected) colors.accentSoft else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(9.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(24.dp)
+                .clip(CircleShape)
+                .background(avatarColor.copy(alpha = if (selected) 0.95f else 0.22f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                initial,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                color = if (selected) Color.White else avatarColor,
+            )
+        }
+        Text(
+            name,
+            modifier = Modifier.weight(1f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (selected) colors.accent else colors.ink,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+        )
+        Text(
+            count.toString(),
+            style = MaterialTheme.typography.labelSmall,
+            color = if (selected) colors.accent else colors.muted,
+        )
     }
 }
 
 @Composable
 internal fun ShelfFilter(label: String, selected: Boolean, onClick: () -> Unit) {
-    Text(label, modifier = Modifier.clip(RoundedCornerShape(20.dp))
-        .background(if (selected) Color(0xFFE7DDEE) else Color.Transparent)
-        .clickable(onClick = onClick).padding(horizontal = 11.dp, vertical = 6.dp),
-        style = MaterialTheme.typography.caption, color = if (selected) violet else muted)
+    val colors = LocalGalleryColors.current
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(20.dp))
+            .background(if (selected) colors.accent else colors.surface)
+            .border(
+                width = 1.dp,
+                color = if (selected) colors.accent else colors.border,
+                shape = RoundedCornerShape(20.dp),
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 13.dp, vertical = 6.dp),
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (selected) Color.White else colors.muted,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+        )
+    }
 }
 
 @Composable
-private fun Cover(post: LibraryPost, onClick: () -> Unit) {
-    Column(Modifier.clip(RoundedCornerShape(8.dp)).clickable(onClick = onClick)) {
-        Box(Modifier.fillMaxWidth().aspectRatio(1.32f).clip(RoundedCornerShape(8.dp)).background(Color(0xFFECE9E6)),
-            contentAlignment = Alignment.Center) {
-            val item = post.assets.firstOrNull { it.isImage }
-            if (item == null) {
-                Text("첨부파일", color = muted, style = MaterialTheme.typography.subtitle2)
+private fun CoverCard(post: LibraryPost, onClick: () -> Unit) {
+    val colors = LocalGalleryColors.current
+    val interactionSource = remember { MutableInteractionSource() }
+    val hovered by interactionSource.collectIsHoveredAsState()
+    val imgCount = remember(post) { post.imageCount() }
+    val attachCount = remember(post) { post.attachmentCount() }
+    val textless = remember(post) { post.hasTextless() }
+    val coverAsset = remember(post) {
+        post.assets.firstOrNull { it.isImage && !it.variant.equals("textless", true) }
+            ?: post.assets.firstOrNull { it.isImage }
+    }
+
+    Column(
+        modifier = Modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(colors.surface)
+            .border(
+                width = if (hovered) 1.5.dp else 1.dp,
+                color = if (hovered) colors.accent else colors.border,
+                shape = RoundedCornerShape(14.dp),
+            )
+            .hoverable(interactionSource)
+            .clickable(onClick = onClick),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(0.76f)
+                .background(colors.surfaceElevated),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (coverAsset == null) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Icon(Icons.Rounded.FolderZip, null, tint = colors.muted, modifier = Modifier.size(30.dp))
+                    Text("첨부파일 전용", color = colors.muted, style = MaterialTheme.typography.labelMedium)
+                }
             } else {
-                val preview = loadImage(File(item.path), item.sha256, 420)
-                if (preview.bitmap != null) Image(preview.bitmap, post.titleLabel(), Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
-                else if (!preview.loading) Text("미리보기 없음", color = muted, style = MaterialTheme.typography.caption)
+                val preview = loadImage(File(coverAsset.path), coverAsset.sha256, 520)
+                if (preview.bitmap != null) {
+                    Image(
+                        bitmap = preview.bitmap,
+                        contentDescription = post.titleLabel(),
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop,
+                        alignment = Alignment.TopCenter,
+                    )
+                } else if (preview.loading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp,
+                        color = colors.muted.copy(alpha = 0.5f),
+                    )
+                } else {
+                    Text("미리보기 없음", color = colors.muted, style = MaterialTheme.typography.labelSmall)
+                }
+            }
+
+            // Top subtle scrim for badges
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+                    .align(Alignment.TopCenter)
+                    .background(
+                        Brush.verticalGradient(
+                            colors = listOf(Color.Black.copy(alpha = 0.56f), Color.Transparent),
+                        ),
+                    ),
+            )
+
+            // Top overlay badges
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .align(Alignment.TopCenter)
+                    .padding(8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (textless) {
+                    OverlayPill(
+                        text = "Textless",
+                        bg = Color(0xCC059669),
+                        fg = Color.White,
+                        icon = Icons.Rounded.AutoAwesome,
+                    )
+                } else {
+                    Spacer(Modifier.width(1.dp))
+                }
+                if (imgCount > 0) {
+                    OverlayPill(
+                        text = "$imgCount",
+                        bg = Color(0xB80E1016),
+                        fg = Color.White,
+                        icon = Icons.Rounded.Image,
+                    )
+                }
+            }
+
+            // Bottom attachment badge
+            if (attachCount > 0) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(8.dp),
+                ) {
+                    OverlayPill(
+                        text = "PSD·첨부 $attachCount",
+                        bg = Color(0xCC4F46E5),
+                        fg = Color.White,
+                    )
+                }
             }
         }
-        Spacer(Modifier.height(7.dp))
-        Text(post.titleLabel(), maxLines = 2, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium, color = ink)
-        Text("${post.artistLabel()} · ${post.yearLabel()} · 파일 ${post.assets.size}개",
-            style = MaterialTheme.typography.caption, maxLines = 1, overflow = TextOverflow.Ellipsis, color = muted)
+
+        Column(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                post.titleLabel(),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.titleSmall,
+                color = colors.ink,
+                lineHeight = 18.sp,
+            )
+            Text(
+                "${post.artistLabel()} · ${post.yearLabel()}",
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = colors.muted,
+            )
+        }
+    }
+}
+
+@Composable
+private fun OverlayPill(
+    text: String,
+    bg: Color,
+    fg: Color,
+    icon: ImageVector? = null,
+) {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(bg)
+            .padding(horizontal = 7.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        if (icon != null) {
+            Icon(icon, contentDescription = null, tint = fg, modifier = Modifier.size(11.dp))
+        }
+        Text(text, fontSize = 10.5.sp, fontWeight = FontWeight.SemiBold, color = fg)
     }
 }

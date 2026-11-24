@@ -1,8 +1,7 @@
 package app.fanboxlibrary.desktop
 
-import androidx.compose.material.MaterialTheme
-import androidx.compose.material.lightColors
 import androidx.compose.ui.graphics.toAwtImage
+import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.test.*
 import app.fanboxlibrary.shared.*
 import org.junit.Assert.*
@@ -28,7 +27,9 @@ class DesktopLibraryTest {
             graphics.fillRect(0, 0, image.width, image.height)
             graphics.color = color.brighter()
             graphics.fillOval(80, 80, 400, 400)
-        } finally { graphics.dispose() }
+        } finally {
+            graphics.dispose()
+        }
         return ByteArrayOutputStream().use { out -> ImageIO.write(image, "png", out); out.toByteArray() }
     }
 
@@ -53,7 +54,7 @@ class DesktopLibraryTest {
         val post = storage.posts().single()
         runComposeUiTest {
             setContent {
-                MaterialTheme(colors = lightColors(primary = violet, secondary = violet, background = paper, onBackground = ink)) {
+                FanboxLibraryTheme(darkTheme = true) {
                     LibraryApp(owner = null, root = home)
                 }
             }
@@ -71,6 +72,34 @@ class DesktopLibraryTest {
             onNodeWithText("다른 이름으로 저장").assertIsDisplayed()
             onNodeWithText("‹ 보관함").performClick()
             onNodeWithText(post.title).assertIsDisplayed()
+        }
+    }
+
+    @OptIn(ExperimentalTestApi::class)
+    @Test fun arrowKeysSwitchWorksInReader() {
+        val home = temporary.newFolder("library-nav")
+        val artist = temporary.newFolder("작가A")
+        val first = File(artist, "2025/작품 B [F200]").apply { mkdirs() }
+        val second = File(artist, "2024/작품 A [F100]").apply { mkdirs() }
+        File(first, "01.png").writeBytes(picture(Color(90, 120, 170)))
+        File(second, "01.png").writeBytes(picture(Color(180, 95, 110)))
+        val storage = LibraryStore(home)
+        storage.indexFolder(artist)
+        runComposeUiTest {
+            setContent {
+                FanboxLibraryTheme(darkTheme = true) {
+                    LibraryApp(owner = null, root = home)
+                }
+            }
+            waitUntil(timeoutMillis = 15_000) { onAllNodesWithText("작품 B").fetchSemanticsNodes().isNotEmpty() }
+            onNodeWithText("작품 B").performClick()
+            onNodeWithText("작품 1/2").assertIsDisplayed()
+            onRoot().performKeyInput { pressKey(Key.DirectionRight) }
+            waitUntil(timeoutMillis = 5_000) { onAllNodesWithText("작품 2/2").fetchSemanticsNodes().isNotEmpty() }
+            onNodeWithText("작품 A").assertIsDisplayed()
+            onRoot().performKeyInput { pressKey(Key.DirectionLeft) }
+            waitUntil(timeoutMillis = 5_000) { onAllNodesWithText("작품 1/2").fetchSemanticsNodes().isNotEmpty() }
+            onNodeWithText("작품 B").assertIsDisplayed()
         }
     }
 

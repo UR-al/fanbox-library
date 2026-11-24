@@ -50,6 +50,7 @@ class OfflineArchiveTest {
             try {
                 val official = allOf(hasAction(Intent.ACTION_VIEW), hasData(Uri.parse("https://www.fanbox.cc/")))
                 Intents.intending(official).respondWith(Instrumentation.ActivityResult(Activity.RESULT_CANCELED, null))
+                ui.onNodeWithText("내 보관함").performClick()
                 ui.onNodeWithText("FANBOX 열기").performClick()
                 Intents.intended(official)
             } finally {

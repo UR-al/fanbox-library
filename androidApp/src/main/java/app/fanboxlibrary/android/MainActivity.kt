@@ -110,6 +110,12 @@ internal class ArchiveModel(application: Application) : AndroidViewModel(applica
         private set
     var moveIds by mutableStateOf<Set<String>>(emptySet())
         private set
+    var savingPostId by mutableStateOf<String?>(null)
+        private set
+    var savingProgress by mutableStateOf("")
+        private set
+    var lastImportTick by mutableStateOf(0)
+        private set
 
     init { refresh() }
 
@@ -199,9 +205,103 @@ internal class ArchiveModel(application: Application) : AndroidViewModel(applica
                     importing = false
                     documents = emptyList()
                     moveIds = emptySet()
+                    lastImportTick++
                 }
             } catch (e: Exception) { reportError(e) }
             finally { busy = false }
+        }
+    }
+
+    fun saveFanboxPost(detail: FanboxPostDetail, includeFiles: Boolean = true) {
+        if (busy || savingPostId != null) return
+        val targets = buildList<Pair<String, String>> {
+            detail.images.forEachIndexed { idx, img ->
+                val prefix = "%02d_".format(idx + 1)
+                add("$prefix${img.fileName}" to img.originalUrl)
+            }
+            if (includeFiles) {
+                detail.files.forEach { f -> add(f.fileName to f.url) }
+            }
+        }
+        if (targets.isEmpty()) {
+            notice = "이 게시글에 저장할 이미지나 파일이 없습니다."
+            return
+        }
+        savingPostId = detail.summary.id
+        savingProgress = "저장 준비 중 (0/${targets.size})…"
+        viewModelScope.launch {
+            var added = 0
+            var reused = 0
+            var skipped = 0
+            var firstWarning = ""
+            try {
+                val draft = PostDraft(
+                    creator = detail.summary.creatorName,
+                    title = detail.summary.title,
+                    year = detail.summary.year,
+                    sourceUrl = detail.summary.postUrl,
+                )
+                for ((idx, pair) in targets.withIndex()) {
+                    val (fileName, url) = pair
+                    savingProgress = "보관함에 저장 중 (${idx + 1}/${targets.size}) · $fileName"
+                    val report = withContext(Dispatchers.IO) {
+                        val source = ImportSource(fileName, "원본/$fileName") {
+                            FanboxClient.openDownloadStream(context, url)
+                        }
+                        store.importManaged(draft, listOf(source))
+                    }
+                    added += report.added
+                    reused += report.reused
+                    skipped += report.skipped
+                    if (firstWarning.isEmpty() && report.warnings.isNotEmpty()) {
+                        firstWarning = report.warnings.first()
+                    }
+                }
+                posts = withContext(Dispatchers.IO) { store.posts() }
+                notice = buildString {
+                    append("내 보관함에 저장 완료 · 추가 ${added}개")
+                    if (reused > 0) append(" · 기존 ${reused}개")
+                    if (skipped > 0) append(" · 건너뜀 ${skipped}개")
+                    if (firstWarning.isNotEmpty()) append("\n$firstWarning")
+                }
+            } catch (e: Exception) {
+                reportError(e)
+            } finally {
+                savingPostId = null
+                savingProgress = ""
+            }
+        }
+    }
+
+    fun saveWebDownload(url: String, fileName: String, pageUrl: String, pageTitle: String) {
+        if (busy || savingPostId != null) {
+            notice = "다른 저장 작업이 진행 중입니다."
+            return
+        }
+        val cleanName = fileName.replace(Regex("""[\\/\p{Cntrl}]"""), "_").ifBlank { "fanbox_file" }
+        val canonicalPostUrl = pageUrl.takeIf { FanboxLinks.postId(it) != null }.orEmpty()
+        savingPostId = "web"
+        savingProgress = "다운로드 저장 중 · $cleanName"
+        viewModelScope.launch {
+            try {
+                val (report, updated) = withContext(Dispatchers.IO) {
+                    val draft = PostDraft(
+                        title = pageTitle.removeSuffix("｜pixivFANBOX").removeSuffix(" - pixivFANBOX").trim(),
+                        sourceUrl = canonicalPostUrl,
+                    )
+                    val source = ImportSource(cleanName, "원본/$cleanName") {
+                        FanboxClient.openDownloadStream(context, url)
+                    }
+                    store.importManaged(draft, listOf(source)) to store.posts()
+                }
+                posts = updated
+                notice = "보관함에 저장했습니다 · $cleanName (${report.summary()})"
+            } catch (e: Exception) {
+                reportError(e)
+            } finally {
+                savingPostId = null
+                savingProgress = ""
+            }
         }
     }
 

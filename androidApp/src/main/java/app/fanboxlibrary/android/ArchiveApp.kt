@@ -37,10 +37,12 @@ import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.Devices
+import androidx.compose.material.icons.rounded.Explore
 import androidx.compose.material.icons.rounded.FolderZip
 import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.LightMode
+import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.SwapHoriz
 import androidx.compose.material.icons.rounded.SystemUpdateAlt
@@ -84,15 +86,23 @@ private enum class PostDetailTab(val label: String) {
     ATTACHMENTS("첨부"),
 }
 
+private enum class MainTab(val label: String) {
+    FANBOX("FANBOX"),
+    LIBRARY("내 보관함"),
+    SYNC("기기 연결"),
+}
+
 @Composable
 internal fun ArchiveApp(model: ArchiveModel) {
     val context = LocalContext.current
     val prefs = remember(context) { context.getSharedPreferences("fanbox_ui_prefs", Context.MODE_PRIVATE) }
     var darkTheme by rememberSaveable { mutableStateOf(prefs.getBoolean("dark_theme", true)) }
 
+    var activeTabName by rememberSaveable { mutableStateOf(MainTab.FANBOX.name) }
+    val activeTab = runCatching { MainTab.valueOf(activeTabName) }.getOrDefault(MainTab.FANBOX)
     var postId by rememberSaveable { mutableStateOf<String?>(null) }
     var readerId by rememberSaveable { mutableStateOf<String?>(null) }
-    var pairing by rememberSaveable { mutableStateOf(false) }
+    var fanboxFullscreen by remember { mutableStateOf(false) }
     var showUpdateDialog by rememberSaveable { mutableStateOf(false) }
     var updateResult by remember { mutableStateOf<UpdateCheckResult?>(null) }
 
@@ -120,6 +130,12 @@ internal fun ArchiveApp(model: ArchiveModel) {
             .sortedWith(compareByDescending<LibraryPost> { it.year ?: 0 }.thenBy { it.label })
     }
 
+    LaunchedEffect(model.lastImportTick) {
+        if (model.lastImportTick > 0) {
+            activeTabName = MainTab.LIBRARY.name
+        }
+    }
+
     val post = model.posts.find { it.id == postId }
     val snackbar = remember { SnackbarHostState() }
     val notice = model.notice
@@ -133,19 +149,29 @@ internal fun ArchiveApp(model: ArchiveModel) {
         model.addDocuments(uris)
     }
 
+    fun toggleTheme() {
+        darkTheme = !darkTheme
+        prefs.edit().putBoolean("dark_theme", darkTheme).apply()
+    }
+
     fun back() {
         when {
             model.importing -> model.cancelImport()
-            pairing -> {
-                pairing = false
-                model.refresh()
-            }
             readerId != null -> readerId = null
-            else -> postId = null
+            activeTab == MainTab.LIBRARY && postId != null -> postId = null
+            activeTab == MainTab.SYNC -> {
+                model.refresh()
+                activeTabName = MainTab.LIBRARY.name
+            }
+            activeTab != MainTab.FANBOX -> activeTabName = MainTab.FANBOX.name
         }
     }
 
-    BackHandler(enabled = model.importing || pairing || postId != null) { back() }
+    BackHandler(enabled = model.importing || readerId != null || postId != null || activeTab != MainTab.FANBOX) {
+        back()
+    }
+
+    val showBottomBar = !model.importing && readerId == null && !fanboxFullscreen
 
     FanboxAndroidTheme(darkTheme = darkTheme) {
         val colors = LocalAndroidGalleryColors.current
@@ -153,14 +179,70 @@ internal fun ArchiveApp(model: ArchiveModel) {
             containerColor = colors.bg,
             snackbarHost = { SnackbarHost(snackbar) },
             contentWindowInsets = WindowInsets.safeDrawing,
+            bottomBar = {
+                if (showBottomBar) {
+                    NavigationBar(
+                        containerColor = colors.surface,
+                        tonalElevation = 0.dp,
+                    ) {
+                        NavigationBarItem(
+                            selected = activeTab == MainTab.FANBOX,
+                            onClick = { activeTabName = MainTab.FANBOX.name },
+                            icon = { Icon(Icons.Rounded.Explore, contentDescription = MainTab.FANBOX.label) },
+                            label = { Text(MainTab.FANBOX.label, fontWeight = FontWeight.SemiBold) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = colors.accent,
+                                selectedTextColor = colors.accent,
+                                indicatorColor = colors.accentSoft,
+                                unselectedIconColor = colors.muted,
+                                unselectedTextColor = colors.muted,
+                            ),
+                        )
+                        NavigationBarItem(
+                            selected = activeTab == MainTab.LIBRARY,
+                            onClick = { activeTabName = MainTab.LIBRARY.name },
+                            icon = {
+                                BadgedBox(
+                                    badge = {
+                                        if (model.posts.isNotEmpty()) {
+                                            Badge(containerColor = colors.accent, contentColor = Color.White) {
+                                                Text("${model.posts.size}")
+                                            }
+                                        }
+                                    },
+                                ) {
+                                    Icon(Icons.Rounded.PhotoLibrary, contentDescription = MainTab.LIBRARY.label)
+                                }
+                            },
+                            label = { Text(MainTab.LIBRARY.label, fontWeight = FontWeight.SemiBold) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = colors.accent,
+                                selectedTextColor = colors.accent,
+                                indicatorColor = colors.accentSoft,
+                                unselectedIconColor = colors.muted,
+                                unselectedTextColor = colors.muted,
+                            ),
+                        )
+                        NavigationBarItem(
+                            selected = activeTab == MainTab.SYNC,
+                            onClick = { activeTabName = MainTab.SYNC.name },
+                            icon = { Icon(Icons.Rounded.Devices, contentDescription = MainTab.SYNC.label) },
+                            label = { Text(MainTab.SYNC.label, fontWeight = FontWeight.SemiBold) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = colors.accent,
+                                selectedTextColor = colors.accent,
+                                indicatorColor = colors.accentSoft,
+                                unselectedIconColor = colors.muted,
+                                unselectedTextColor = colors.muted,
+                            ),
+                        )
+                    }
+                }
+            },
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding)) {
                 when {
                     model.importing -> ImportView(model, pick = { picker.launch(arrayOf("*/*")) }, back = ::back)
-                    pairing -> PairingScreen(model.store) {
-                        pairing = false
-                        model.refresh()
-                    }
                     post != null && readerId != null -> ReaderView(
                         post = post,
                         visiblePosts = visiblePosts.ifEmpty { model.posts },
@@ -174,11 +256,27 @@ internal fun ArchiveApp(model: ArchiveModel) {
                         back = ::back,
                         error = { model.notice = it },
                     )
+                    activeTab == MainTab.FANBOX -> FanboxHubScreen(
+                        model = model,
+                        darkTheme = darkTheme,
+                        onToggleTheme = ::toggleTheme,
+                        hasUpdate = updateResult is UpdateCheckResult.UpdateAvailable,
+                        onOpenUpdate = { showUpdateDialog = true },
+                        onOpenArchivedPost = { localId ->
+                            postId = localId
+                            activeTabName = MainTab.LIBRARY.name
+                        },
+                        onFullscreenChanged = { fanboxFullscreen = it },
+                    )
+                    activeTab == MainTab.SYNC -> PairingScreen(model.store) {
+                        model.refresh()
+                        activeTabName = MainTab.LIBRARY.name
+                    }
                     post != null -> PostView(
                         post = post,
                         visiblePosts = visiblePosts.ifEmpty { model.posts },
                         onSelectPost = { postId = it },
-                        back = ::back,
+                        back = { postId = null },
                         read = { readerId = it },
                         add = { model.beginImport(post.asDraft()) },
                         move = { selected -> model.beginImport(sourceId = post.id, selected = selected) },
@@ -194,16 +292,13 @@ internal fun ArchiveApp(model: ArchiveModel) {
                         smartFilter = smartFilter,
                         onSmartFilter = { smartFilterName = it.name },
                         darkTheme = darkTheme,
-                        onToggleTheme = {
-                            darkTheme = !darkTheme
-                            prefs.edit().putBoolean("dark_theme", darkTheme).apply()
-                        },
+                        onToggleTheme = ::toggleTheme,
                         hasUpdate = updateResult is UpdateCheckResult.UpdateAvailable,
                         onOpenUpdate = { showUpdateDialog = true },
                         open = { postId = it },
                         browse = { openOfficial(context, FANBOX_HOME) { model.notice = it } },
                         add = { model.beginImport() },
-                        pair = { pairing = true },
+                        pair = { activeTabName = MainTab.SYNC.name },
                     )
                 }
             }

@@ -50,6 +50,8 @@ data class ImportReport(
 object FanboxLinks {
     private val host = Regex("""(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)?fanbox\.cc""")
     private val postPath = Regex("""(?:/@[A-Za-z0-9_-]+)?/posts/([1-9][0-9]{0,18})/?""")
+    private val patreonHost = Regex("""(?:www\.)?patreon\.com""")
+    private val patreonPostPath = Regex("""/posts/(?:[^/]*-)?([1-9][0-9]{0,18})/?""")
 
     private fun official(raw: String): URI? {
         val uri = runCatching { URI(raw.trim()) }.getOrNull() ?: return null
@@ -59,16 +61,38 @@ object FanboxLinks {
         }
     }
 
+    private fun officialPatreon(raw: String): URI? {
+        val uri = runCatching { URI(raw.trim()) }.getOrNull() ?: return null
+        return uri.takeIf {
+            it.scheme.equals("https", true) && it.rawUserInfo == null && it.port in listOf(-1, 443) &&
+                it.host?.lowercase(Locale.ROOT)?.matches(patreonHost) == true
+        }
+    }
+
     fun isOfficialUrl(url: String): Boolean = official(url) != null
+
+    fun isPatreonUrl(url: String): Boolean = officialPatreon(url) != null
 
     fun postId(url: String): String? =
         official(url)?.rawPath?.let { postPath.matchEntire(it)?.groupValues?.get(1) }
 
+    fun patreonPostId(url: String): String? =
+        officialPatreon(url)?.rawPath?.let { patreonPostPath.matchEntire(it)?.groupValues?.get(1) }
+
+    internal fun sourceKey(url: String): String? =
+        postId(url)?.let { "fanbox:$it" } ?: patreonPostId(url)?.let { "patreon:$it" }
+
     internal fun canonicalPost(url: String): String {
         if (url.isBlank()) return ""
-        val uri = official(url)
-        require(uri != null && postId(url) != null) { "공식 FANBOX 게시물 주소를 입력하세요." }
-        return "https://${uri.host.lowercase(Locale.ROOT)}${uri.rawPath.trimEnd('/')}"
+        val fanboxUri = official(url)
+        if (fanboxUri != null && postId(url) != null) {
+            return "https://${fanboxUri.host.lowercase(Locale.ROOT)}${fanboxUri.rawPath.trimEnd('/')}"
+        }
+        val patreonUri = officialPatreon(url)
+        if (patreonUri != null && patreonPostId(url) != null) {
+            return "https://www.patreon.com${patreonUri.rawPath.trimEnd('/')}"
+        }
+        throw IllegalArgumentException("공식 FANBOX 또는 Patreon 게시물 주소를 입력하세요.")
     }
 
     internal fun creator(url: String): String? {

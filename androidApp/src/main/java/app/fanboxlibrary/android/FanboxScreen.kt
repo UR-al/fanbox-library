@@ -120,6 +120,7 @@ internal fun FanboxHubScreen(
     val category = runCatching { FeedCategory.valueOf(categoryName) }.getOrDefault(FeedCategory.HOME)
 
     var showAdult by rememberSaveable { mutableStateOf(prefs.getBoolean("show_adult", false)) }
+    var hideTextPosts by rememberSaveable { mutableStateOf(prefs.getBoolean("hide_text_posts", false)) }
     var gridMode by rememberSaveable { mutableStateOf(prefs.getBoolean("feed_grid_mode", false)) }
     var loggedIn by remember { mutableStateOf(FanboxSession.hasLoginCookie()) }
 
@@ -253,7 +254,12 @@ internal fun FanboxHubScreen(
                     val updated = fullCreator.copy(isFollowed = desired)
                     if (selectedCreator?.creatorId == updated.creatorId) selectedCreator = updated
                     searchResults = searchResults.map { if (it.creatorId == updated.creatorId) updated else it }
-                    creators = creators.map { if (it.creatorId == updated.creatorId) updated else it }
+                    creators = if (desired) {
+                        (creators.filterNot { it.creatorId == updated.creatorId } + updated).sortedByDescending { it.isSupporting }
+                    } else {
+                        creators.filterNot { it.creatorId == updated.creatorId && !it.isSupporting }
+                            .map { if (it.creatorId == updated.creatorId) updated else it }
+                    }
                     model.notice = if (desired) "${updated.name} 작가를 팔로우했습니다." else "${updated.name} 팔로우를 해제했습니다."
                 }
                 is FanboxResult.AuthRequired -> {
@@ -412,6 +418,26 @@ internal fun FanboxHubScreen(
                         fontSize = 10.5.sp,
                         fontWeight = FontWeight.Bold,
                         color = if (showAdult) colors.accent else colors.muted,
+                    )
+                }
+
+                // Hide Text Posts Toggle
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(if (hideTextPosts) colors.secondarySoft else colors.surface)
+                        .border(1.dp, if (hideTextPosts) colors.secondary else colors.border, RoundedCornerShape(9.dp))
+                        .clickable {
+                            hideTextPosts = !hideTextPosts
+                            prefs.edit().putBoolean("hide_text_posts", hideTextPosts).apply()
+                        }
+                        .padding(horizontal = 7.dp, vertical = 6.dp),
+                ) {
+                    Text(
+                        if (hideTextPosts) "글숨김" else "글표시",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (hideTextPosts) colors.secondary else colors.muted,
                     )
                 }
 
@@ -662,8 +688,10 @@ internal fun FanboxHubScreen(
                     val hiddenAdultCount = remember(feedItems, showAdult) {
                         if (showAdult) 0 else feedItems.count { it.hasAdultContent }
                     }
-                    val visibleFeed = remember(feedItems, showAdult) {
-                        if (showAdult) feedItems else feedItems.filterNot { it.hasAdultContent }
+                    val visibleFeed = remember(feedItems, showAdult, hideTextPosts) {
+                        feedItems.filter { p ->
+                            (showAdult || !p.hasAdultContent) && (!hideTextPosts || !p.isTextOnly)
+                        }
                     }
                     FeedPostsPane(
                         posts = visibleFeed,

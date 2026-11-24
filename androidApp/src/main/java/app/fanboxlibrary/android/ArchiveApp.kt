@@ -310,6 +310,7 @@ internal fun ArchiveApp(model: ArchiveModel) {
                         openPsd = { asset -> activePsd = ActivePsdSession(File(asset.path), asset.name) },
                         add = { model.beginImport(post.asDraft()) },
                         move = { selected -> model.beginImport(sourceId = post.id, selected = selected) },
+                        deleteAssets = { selected -> model.deleteAssets(post.id, selected) },
                         error = { model.notice = it },
                     )
                     else -> LibraryView(
@@ -891,6 +892,7 @@ private fun PostView(
     openPsd: (LibraryAsset) -> Unit,
     add: () -> Unit,
     move: (Set<String>) -> Unit,
+    deleteAssets: (Set<String>) -> Unit,
     error: (String) -> Unit,
 ) {
     val colors = LocalAndroidGalleryColors.current
@@ -984,6 +986,7 @@ private fun PostView(
                 openPsd = openPsd,
                 add = add,
                 move = move,
+                deleteAssets = deleteAssets,
                 error = error,
                 modifier = Modifier.graphicsLayer { translationX = dragOffset.value },
             )
@@ -1039,6 +1042,7 @@ private fun PostDetailBody(
     openPsd: (LibraryAsset) -> Unit,
     add: () -> Unit,
     move: (Set<String>) -> Unit,
+    deleteAssets: (Set<String>) -> Unit,
     error: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -1160,11 +1164,24 @@ private fun PostDetailBody(
                 }
 
                 if (selecting) {
-                    Button(
-                        onClick = { move(selected) },
-                        enabled = selected.isNotEmpty(),
-                        shape = RoundedCornerShape(10.dp),
-                    ) { Text("선택한 ${selected.size}개 묶기") }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = { move(selected) },
+                            enabled = selected.isNotEmpty(),
+                            shape = RoundedCornerShape(10.dp),
+                        ) { Text("선택 ${selected.size}개 묶기") }
+                        OutlinedButton(
+                            onClick = {
+                                val ids = selected
+                                selecting = false
+                                selected = emptySet()
+                                deleteAssets(ids)
+                            },
+                            enabled = selected.isNotEmpty(),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.error),
+                        ) { Text("삭제 (${selected.size})", color = MaterialTheme.colorScheme.error) }
+                    }
                 }
 
                 // Variant / Attachment Filter Tabs

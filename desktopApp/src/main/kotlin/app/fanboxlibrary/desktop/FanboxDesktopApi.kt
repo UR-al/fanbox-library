@@ -36,6 +36,11 @@ import javax.imageio.ImageIO
 import kotlin.math.ceil
 import kotlin.math.max
 
+internal enum class FeedService(val label: String) {
+    FANBOX("FANBOX"),
+    PATREON("Patreon"),
+}
+
 internal data class DesktopFanboxCreator(
     val creatorId: String,
     val userId: String = "",
@@ -46,6 +51,8 @@ internal data class DesktopFanboxCreator(
     val isSupporting: Boolean = false,
     val isFollowed: Boolean = false,
     val planFee: Int = 0,
+    val service: FeedService = FeedService.FANBOX,
+    val campaignUrl: String = "",
 )
 
 internal data class DesktopFanboxPlan(
@@ -96,10 +103,19 @@ internal data class DesktopFanboxPostSummary(
     val hasAdultContent: Boolean,
     val likeCount: Int,
     val type: String,
+    val tags: List<String> = emptyList(),
+    val service: FeedService = FeedService.FANBOX,
+    val customPostUrl: String = "",
 ) {
     val year: Int? get() = publishedDatetime.take(4).toIntOrNull()
-    val postUrl: String get() = "https://${creatorId.ifBlank { "www" }}.fanbox.cc/posts/$id"
+    val postUrl: String
+        get() = customPostUrl.ifBlank {
+            if (service == FeedService.PATREON) "https://www.patreon.com/posts/$id"
+            else "https://${creatorId.ifBlank { "www" }}.fanbox.cc/posts/$id"
+        }
     val displayDate: String get() = publishedDatetime.take(10)
+    val isTextOnly: Boolean get() = type.equals("text", true) || (coverImageUrl.isNullOrBlank() && type != "image" && type != "file")
+    val uniqueKey: String get() = "${service.name}:$id"
 }
 
 internal data class DesktopFanboxPostDetail(
@@ -217,11 +233,41 @@ internal object DesktopFanboxClient {
         return requestJson(url, requireAuth = true) { parseFeedPage(it) }
     }
 
-    fun fetchCreatorPosts(creatorId: String, nextUrl: String? = null): DesktopFanboxResult<DesktopFanboxFeedPage> {
+    fun fetchCreatorPosts(creatorId: String, nextUrl: String? = null, tag: String? = null): DesktopFanboxResult<DesktopFanboxFeedPage> {
         val encoded = URLEncoder.encode(creatorId, "UTF-8")
+        val tagPart = tag?.trim()?.takeIf { it.isNotEmpty() }?.let { "&tag=${URLEncoder.encode(it, "UTF-8")}" }.orEmpty()
         val url = nextUrl?.takeIf { isAllowedApiUrl(it) }
-            ?: "${DesktopFanboxSession.API_BASE}/post.listCreator?creatorId=$encoded&limit=24"
+            ?: "${DesktopFanboxSession.API_BASE}/post.listCreator?creatorId=$encoded&limit=24$tagPart"
         return requestJson(url, requireAuth = false) { parseFeedPage(it) }
+    }
+
+    fun fetchRecommendedCreators(): DesktopFanboxResult<List<DesktopFanboxCreator>> {
+        return requestJson("${DesktopFanboxSession.API_BASE}/creator.listRecommended?limit=20", requireAuth = false) { root ->
+            val arr = when (val b = root["body"]) {
+                is List<*> -> b
+                is Map<*, *> -> (b["creators"] as? List<*>) ?: (b["items"] as? List<*>) ?: emptyList<Any?>()
+                else -> emptyList<Any?>()
+            }
+            arr.mapNotNull { (it as? Map<*, *>)?.let { m -> parseCreator(m) } }
+        }
+    }
+
+    fun fetchCreatorTags(creatorId: String): DesktopFanboxResult<List<String>> {
+        val encoded = URLEncoder.encode(creatorId, "UTF-8")
+        return requestJson("${DesktopFanboxSession.API_BASE}/tag.getFeatured?creatorId=$encoded", requireAuth = false) { root ->
+            val arr = when (val b = root["body"]) {
+                is List<*> -> b
+                is Map<*, *> -> (b["tags"] as? List<*>) ?: emptyList<Any?>()
+                else -> emptyList<Any?>()
+            }
+            arr.mapNotNull { item ->
+                when (item) {
+                    is String -> item.trim().takeIf { it.isNotEmpty() }
+                    is Map<*, *> -> (item["tag"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+                    else -> null
+                }
+            }
+        }
     }
 
     fun fetchCreatorProfile(creatorId: String): DesktopFanboxResult<DesktopFanboxCreator> {
@@ -337,7 +383,8 @@ internal object DesktopFanboxClient {
         if (creatorUserId.isBlank()) return DesktopFanboxResult.Error("작가 사용자 ID가 없습니다.")
         val csrf = ensureCsrfToken()
             ?: return DesktopFanboxResult.Error("보안 토큰(CSRF)을 가져오지 못했습니다. 로그인 쿠키를 확인해 주세요.")
-        val endpoint = if (follow) "creator.follow" else "creator.unfollow"
+        // Actual 2026 FANBOX endpoints verified via API probe: follow.create / follow.delete
+        val endpoint = if (follow) "follow.create" else "follow.delete"
         val jsonBody = """{"creatorUserId":"${creatorUserId.replace("\"", "")}"}"""
         return requestJson(
             url = "${DesktopFanboxSession.API_BASE}/$endpoint",
@@ -468,6 +515,7 @@ internal object DesktopFanboxClient {
         val user = obj["user"] as? Map<*, *>
         val cid = obj.str("creatorId").ifBlank { user?.str("userId").orEmpty() }
         val cover = obj.optStr("coverImageUrl") ?: (obj["cover"] as? Map<*, *>)?.optStr("url")
+        val tags = (obj["tags"] as? List<*>).orEmpty().mapNotNull { (it as? String)?.trim()?.takeIf(String::isNotEmpty) }
         return DesktopFanboxPostSummary(
             id = id,
             title = obj.str("title").ifBlank { "제목 없는 게시글" },
@@ -482,6 +530,8 @@ internal object DesktopFanboxClient {
             hasAdultContent = obj.boolVal("hasAdultContent"),
             likeCount = obj.intVal("likeCount"),
             type = obj.str("type").ifBlank { "image" },
+            tags = tags,
+            service = FeedService.FANBOX,
         )
     }
 
@@ -578,7 +628,9 @@ internal object DesktopFanboxClient {
         val host = uri.host?.lowercase() ?: return false
         return host == "fanbox.cc" || host.endsWith(".fanbox.cc") ||
             host == "pximg.net" || host.endsWith(".pximg.net") ||
-            host.endsWith(".pixiv.net")
+            host.endsWith(".pixiv.net") ||
+            host == "patreon.com" || host.endsWith(".patreon.com") ||
+            host == "patreonusercontent.com" || host.endsWith(".patreonusercontent.com")
     }
 
     private fun Map<*, *>.str(k: String): String = (this[k] as? String).orEmpty()
@@ -607,7 +659,7 @@ internal object DesktopFanboxClient {
     }
 }
 
-private object SimpleJson {
+internal object SimpleJson {
     fun parse(text: String): Any? = Parser(text).parseValue()
 
     private class Parser(private val s: String) {
@@ -728,18 +780,48 @@ internal object DesktopWebLogin {
         return candidates.firstOrNull { it.isFile }
     }
 
-    suspend fun runPopupLogin(onStatus: (String) -> Unit): Result<String> = withContext(Dispatchers.IO) {
+    suspend fun runPopupLogin(onStatus: (String) -> Unit): Result<String> =
+        runServicePopupLogin(
+            loginUrl = "https://www.fanbox.cc/login",
+            profileSubDir = "web-login-profile",
+            targetDomainSuffix = "fanbox.cc",
+            requiredCookieName = "FANBOXSESSID",
+            serviceLabel = "FANBOX",
+            onSave = { DesktopFanboxSession.saveSessionInput(it) },
+            onStatus = onStatus,
+        )
+
+    suspend fun runPatreonPopupLogin(onStatus: (String) -> Unit): Result<String> =
+        runServicePopupLogin(
+            loginUrl = "https://www.patreon.com/login",
+            profileSubDir = "patreon-login-profile",
+            targetDomainSuffix = "patreon.com",
+            requiredCookieName = "session_id",
+            serviceLabel = "Patreon",
+            onSave = { DesktopPatreonSession.saveCookie(it) },
+            onStatus = onStatus,
+        )
+
+    private suspend fun runServicePopupLogin(
+        loginUrl: String,
+        profileSubDir: String,
+        targetDomainSuffix: String,
+        requiredCookieName: String,
+        serviceLabel: String,
+        onSave: (String) -> Unit,
+        onStatus: (String) -> Unit,
+    ): Result<String> = withContext(Dispatchers.IO) {
         val browser = findBrowser()
             ?: return@withContext Result.failure(IllegalStateException("Chrome 또는 Edge 브라우저를 찾을 수 없습니다. 아래 쿠키 직접 입력을 이용해 주세요."))
 
         val port = ServerSocket(0).use { it.localPort }
         val baseDir = System.getenv("LOCALAPPDATA")?.let(::File) ?: File(System.getProperty("user.home"), ".local/share")
-        val profileDir = File(File(baseDir, "FanboxLibrary"), "web-login-profile").apply { mkdirs() }
+        val profileDir = File(File(baseDir, "FanboxLibrary"), profileSubDir).apply { mkdirs() }
 
-        onStatus("${browser.nameWithoutExtension} 로그인 창을 여는 중…")
+        onStatus("${browser.nameWithoutExtension} $serviceLabel 로그인 창을 여는 중…")
         val process = ProcessBuilder(
             browser.absolutePath,
-            "--app=https://www.fanbox.cc/login",
+            "--app=$loginUrl",
             "--window-size=540,780",
             "--no-first-run",
             "--no-default-browser-check",
@@ -749,7 +831,6 @@ internal object DesktopWebLogin {
 
         var ws: WebSocket? = null
         try {
-            // Wait up to 15s for browser debugging endpoint to come up
             var wsUrl: String? = null
             for (attempt in 0 until 30) {
                 if (!isActive) throw CancellationException()
@@ -764,7 +845,7 @@ internal object DesktopWebLogin {
                 return@withContext Result.failure(IllegalStateException("로그인 창 연결에 실패했습니다. 기존 로그인 창이 열려 있다면 닫고 다시 시도해 주세요."))
             }
 
-            onStatus("팝업 창에서 pixiv / FANBOX에 로그인하세요. 완료되면 자동으로 연결됩니다.")
+            onStatus("팝업 창에서 $serviceLabel 에 로그인하세요. 완료되면 자동으로 연결됩니다.")
 
             val responses = ConcurrentHashMap<Int, CompletableDeferred<String>>()
             val opened = CompletableDeferred<Boolean>()
@@ -797,7 +878,6 @@ internal object DesktopWebLogin {
             }
 
             val idGen = AtomicInteger(1)
-            // Poll cookies every 1 second for up to 5 minutes until FANBOXSESSID appears
             repeat(300) {
                 if (!isActive) throw CancellationException()
                 if (!process.isAlive || closed.isCompleted) {
@@ -812,10 +892,10 @@ internal object DesktopWebLogin {
                 val reply = withTimeoutOrNull(3_000L) { def.await() }
                 responses.remove(reqId)
 
-                val cookieHeader = reply?.let(::extractFanboxCookiesFromCdp)
+                val cookieHeader = reply?.let { extractCookiesFromCdp(it, targetDomainSuffix, requiredCookieName) }
                 if (!cookieHeader.isNullOrBlank()) {
-                    onStatus("로그인 완료! 창을 닫고 피드를 불러오는 중…")
-                    DesktopFanboxSession.saveSessionInput(cookieHeader)
+                    onStatus("$serviceLabel 로그인 완료! 창을 닫고 피드를 불러오는 중…")
+                    onSave(cookieHeader)
                     runCatching { ws.send("""{"id":${idGen.getAndIncrement()},"method":"Browser.close"}""") }
                     delay(300)
                     return@withContext Result.success(cookieHeader)
@@ -838,7 +918,7 @@ internal object DesktopWebLogin {
         }
     }.getOrNull()
 
-    private fun extractFanboxCookiesFromCdp(rawJson: String): String? {
+    private fun extractCookiesFromCdp(rawJson: String, domainSuffix: String, requiredCookie: String): String? {
         val root = SimpleJson.parse(rawJson) as? Map<*, *> ?: return null
         val result = root["result"] as? Map<*, *> ?: return null
         val cookies = result["cookies"] as? List<*> ?: return null
@@ -848,11 +928,11 @@ internal object DesktopWebLogin {
             val domain = (c["domain"] as? String).orEmpty().lowercase()
             val name = (c["name"] as? String).orEmpty()
             val value = (c["value"] as? String).orEmpty()
-            if (domain.endsWith("fanbox.cc") && name.isNotBlank() && value.isNotBlank()) {
+            if (domain.endsWith(domainSuffix) && name.isNotBlank() && value.isNotBlank()) {
                 matched[name] = value
             }
         }
-        val sess = matched["FANBOXSESSID"]
+        val sess = matched[requiredCookie]
         if (sess.isNullOrBlank()) return null
         return matched.entries.joinToString("; ") { "${it.key}=${it.value}" }
     }

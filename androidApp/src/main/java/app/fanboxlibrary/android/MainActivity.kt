@@ -311,6 +311,42 @@ internal class ArchiveModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    fun deleteAssets(postId: String, assetIds: Set<String>) {
+        if (busy || assetIds.isEmpty()) return
+        busy = true
+        viewModelScope.launch {
+            try {
+                val (removed, updated) = withContext(Dispatchers.IO) {
+                    store.deleteAssets(postId, assetIds) to store.posts()
+                }
+                posts = updated
+                if (removed > 0) notice = "선택한 ${removed}개 파일을 삭제했습니다."
+            } catch (e: Exception) {
+                reportError(e)
+            } finally {
+                busy = false
+            }
+        }
+    }
+
+    fun mergeSeries(targetPostId: String, sourcePostIds: Set<String>, seriesTitle: String) {
+        if (busy || sourcePostIds.isEmpty()) return
+        busy = true
+        viewModelScope.launch {
+            try {
+                val (report, updated) = withContext(Dispatchers.IO) {
+                    store.mergePosts(targetPostId, sourcePostIds, newTitle = seriesTitle) to store.posts()
+                }
+                posts = updated
+                notice = "시리즈로 합쳤습니다 (${report.summary()})"
+            } catch (e: Exception) {
+                reportError(e)
+            } finally {
+                busy = false
+            }
+        }
+    }
+
     private fun reportError(e: Exception) {
         if (e is CancellationException) throw e
         notice = e.localizedMessage ?: "보관함을 열 수 없습니다."

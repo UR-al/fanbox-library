@@ -90,11 +90,11 @@ class LibraryStore(root: File) {
 
     /** A peer never supplies a local path. Its manifest is committed only after every blob verifies. */
     fun importPeerPost(peerId: String, draft: PostDraft, sources: List<PeerAssetSource>): ImportReport = locked { index ->
-        require(peerId.matches(Regex("""(?:fanbox:[1-9][0-9]{0,18}|(?:local|folder):[a-f0-9]{64})"""))) { "알 수 없는 작품 ID입니다." }
+        require(peerId.matches(Regex("""(?:(?:fanbox|patreon):[1-9][0-9]{0,18}|(?:local|folder):[a-f0-9]{64})"""))) { "알 수 없는 작품 ID입니다." }
         require(draft.existingId == null) { "동기화 데이터에 로컬 대상이 포함되어 있습니다." }
         validateDraft(index, draft)
-        val sourceId = FanboxLinks.postId(draft.sourceUrl)?.let { "fanbox:$it" }
-        require(!peerId.startsWith("fanbox:") || sourceId == null || sourceId == peerId) { "게시물 주소와 작품 ID가 다릅니다." }
+        val sourceId = FanboxLinks.sourceKey(draft.sourceUrl)
+        require(!(peerId.startsWith("fanbox:") || peerId.startsWith("patreon:")) || sourceId == null || sourceId == peerId) { "게시물 주소와 작품 ID가 다릅니다." }
         if (sources.isEmpty()) return@locked ImportReport()
         val key = sourceId ?: peerId
         val post = index.posts.getOrPut(key) { newRecord(key, draft.copy(sourceUrl = FanboxLinks.canonicalPost(draft.sourceUrl))) }
@@ -275,6 +275,78 @@ class LibraryStore(root: File) {
         counter.report()
     }
 
+    /**
+     * Merges multiple posts (e.g., episodes of a series) into a single target post.
+     * Optionally updates the merged series title and creator.
+     */
+    fun mergePosts(
+        targetPostId: String,
+        sourcePostIds: Set<String>,
+        newTitle: String? = null,
+        newCreator: String? = null,
+    ): ImportReport = locked { index ->
+        val target = requireNotNull(index.posts[targetPostId]) { "기준 작품을 찾을 수 없습니다." }
+        if (!newTitle.isNullOrBlank()) target.title = newTitle.trim()
+        if (!newCreator.isNullOrBlank()) target.creator = newCreator.trim()
+        val counter = Counters()
+        for (srcId in sourcePostIds) {
+            if (srcId == target.id) continue
+            val source = index.posts[srcId] ?: continue
+            val entries = source.entries.values.toList()
+            for (entry in entries) {
+                if (target.entries.putIfAbsent(entry.id, entry) == null) counter.added++ else counter.reused++
+                source.entries.remove(entry.id)
+                index.relocated.add(source.id to entry.id)
+                index.relocated.remove(target.id to entry.id)
+            }
+            if (source.entries.isEmpty()) index.posts.remove(source.id)
+        }
+        index.saveTo(indexFile)
+        counter.report()
+    }
+
+    /**
+     * Removes selected images/attachments from a post in the library index.
+     * Cleans up unreferenced app-managed blobs inside [managed], while NEVER deleting external linked user files.
+     */
+    fun deleteAssets(postId: String, assetIds: Set<String>): Int = locked { index ->
+        val post = index.posts[postId] ?: return@locked 0
+        if (assetIds.isEmpty()) return@locked 0
+        var removed = 0
+        val touchedHashes = hashSetOf<String>()
+        for (id in assetIds) {
+            val entry = post.entries.remove(id) ?: continue
+            index.relocated.add(post.id to entry.id)
+            touchedHashes.add(entry.hash)
+            removed++
+        }
+        if (post.entries.isEmpty()) {
+            index.posts.remove(post.id)
+        }
+        if (removed > 0) {
+            val stillReferenced = hashSetOf<String>()
+            index.posts.values.forEach { p -> p.entries.values.forEach { stillReferenced.add(it.hash) } }
+            for (hash in touchedHashes) {
+                if (hash !in stillReferenced) {
+                    index.blobs.remove(hash)
+                    val blobFile = managedFile(hash)
+                    if (blobFile.isFile && blobFile.canonicalFile.toPath().startsWith(managed.canonicalFile.toPath())) {
+                        runCatching { blobFile.delete() }
+                    }
+                }
+            }
+            index.saveTo(indexFile)
+        }
+        removed
+    }
+
+    fun renamePost(postId: String, newTitle: String, newCreator: String? = null) = locked { index ->
+        val post = requireNotNull(index.posts[postId]) { "작품을 찾을 수 없습니다." }
+        if (newTitle.isNotBlank()) post.title = newTitle.trim()
+        if (!newCreator.isNullOrBlank()) post.creator = newCreator.trim()
+        index.saveTo(indexFile)
+    }
+
     private fun prepareExisting(raw: File, variant: String): Prepared {
         val file = raw.canonicalFile
         require(file.isFile && !file.toPath().startsWith(root.toPath())) { "참조할 수 있는 외부 파일을 선택하세요." }
@@ -293,15 +365,16 @@ class LibraryStore(root: File) {
         require(draft.year == null || draft.year in 1..9999) { "올바른 연도를 입력하세요." }
         if (draft.existingId != null) {
             val existing = requireNotNull(index.posts[draft.existingId]) { "지정한 작품을 찾을 수 없습니다." }
-            if (normalized.isNotEmpty() && existing.id.startsWith("fanbox:")) {
-                require(existing.id == "fanbox:${FanboxLinks.postId(normalized)}") { "서로 다른 FANBOX 게시물입니다." }
+            val incomingKey = FanboxLinks.sourceKey(normalized)
+            if (incomingKey != null && (existing.id.startsWith("fanbox:") || existing.id.startsWith("patreon:"))) {
+                require(existing.id == incomingKey) { "서로 다른 게시물입니다." }
             }
         }
     }
 
     private fun destination(index: LibraryIndex, draft: PostDraft, ids: List<String>): PostRecord {
         val normalized = FanboxLinks.canonicalPost(draft.sourceUrl)
-        val key = FanboxLinks.postId(normalized)?.let { "fanbox:$it" }
+        val key = FanboxLinks.sourceKey(normalized)
             ?: draft.existingId
             ?: "local:" + digestText((listOf(draft.creator.trim(), draft.title.trim(), draft.year?.toString().orEmpty()) +
                 ids.distinct().sorted()).joinToString("\u0000"))
@@ -315,7 +388,11 @@ class LibraryStore(root: File) {
 
     private fun newRecord(key: String, draft: PostDraft) = PostRecord(key,
         draft.creator.trim().ifEmpty { FanboxLinks.creator(draft.sourceUrl) ?: "미분류" },
-        draft.title.trim().ifEmpty { FanboxLinks.postId(draft.sourceUrl)?.let { "FANBOX #$it" } ?: "미분류" },
+        draft.title.trim().ifEmpty {
+            FanboxLinks.postId(draft.sourceUrl)?.let { "FANBOX #$it" }
+                ?: FanboxLinks.patreonPostId(draft.sourceUrl)?.let { "Patreon #$it" }
+                ?: "미분류"
+        },
         draft.year, draft.sourceUrl)
 
     private fun attach(index: LibraryIndex, post: PostRecord, item: Prepared, counter: Counters) {

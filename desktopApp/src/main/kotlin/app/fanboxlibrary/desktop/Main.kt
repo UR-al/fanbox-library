@@ -523,6 +523,11 @@ internal fun LibraryApp(
                     onPost = { selected = it },
                     onBrowse = { browse = true },
                     onLinkFolder = ::linkArtistFolder,
+                    onMergeSeries = { targetId, sourceIds, seriesTitle ->
+                        update("선택한 작품을 시리즈로 합치는 중…") {
+                            it.mergePosts(targetId, sourceIds, newTitle = seriesTitle)
+                        }
+                    },
                 )
 
                 else -> key(currentPost.id) {
@@ -544,6 +549,21 @@ internal fun LibraryApp(
                         },
                         openZip = { asset -> activeZipAsset = asset },
                         openPsd = { asset -> activePsdTarget = File(asset.path) to asset.name },
+                        onDeleteAsset = { asset ->
+                            val loaded = store ?: return@PostReader
+                            scope.launch {
+                                try {
+                                    val (removed, latest) = withContext(Dispatchers.IO) {
+                                        loaded.deleteAssets(currentPost.id, setOf(asset.id)) to loaded.posts()
+                                    }
+                                    posts = latest
+                                    if (latest.none { it.id == currentPost.id }) selected = null
+                                    if (removed > 0) notice = Notice("보관함에서 ‘${asset.name}’ 항목을 삭제했습니다.")
+                                } catch (e: Exception) {
+                                    notice = Notice("삭제 실패: " + (e.localizedMessage ?: e.javaClass.simpleName))
+                                }
+                            }
+                        },
                     )
                 }
             }

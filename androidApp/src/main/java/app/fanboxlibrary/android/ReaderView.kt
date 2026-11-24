@@ -93,37 +93,10 @@ internal fun ReaderView(
     val isCurrentTextless = visible.variant.equals("textless", true)
     var currentZoomed by remember(post.id, pager.currentPage) { mutableStateOf(false) }
 
-    // Boundary overscroll swipe detector: swiping past first/last image switches to prev/next work!
-    var overscrollX by remember(post.id, pager.currentPage) { mutableFloatStateOf(0f) }
-    val boundarySwipe = remember(post.id, pager.currentPage, prevPost?.id, nextPost?.id, currentZoomed) {
-        object : NestedScrollConnection {
-            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
-                if (source == NestedScrollSource.UserInput && !currentZoomed) {
-                    val atStart = pager.currentPage == 0 && prevPost != null && available.x > 0f
-                    val atEnd = pager.currentPage == images.lastIndex && nextPost != null && available.x < 0f
-                    if (atStart || atEnd) {
-                        overscrollX += available.x
-                    } else if (kotlin.math.abs(consumed.x) > 1f) {
-                        overscrollX = 0f
-                    }
-                }
-                return Offset.Zero
-            }
-
-            override suspend fun onPreFling(available: Velocity): Velocity {
-                val triggeredPrev = pager.currentPage == 0 && prevPost != null &&
-                    (overscrollX > boundaryThresholdPx || (overscrollX > boundaryThresholdPx * 0.45f && available.x > 700f))
-                val triggeredNext = pager.currentPage == images.lastIndex && nextPost != null &&
-                    (overscrollX < -boundaryThresholdPx || (overscrollX < -boundaryThresholdPx * 0.45f && available.x < -700f))
-                overscrollX = 0f
-                when {
-                    triggeredPrev -> onSwitchPost(prevPost!!, true)
-                    triggeredNext -> onSwitchPost(nextPost!!, false)
-                }
-                return Velocity.Zero
-            }
-        }
-    }
+    // Do not auto-switch works when swiping past the first/last image of a work;
+    // users can switch works intentionally via bottom bar buttons or PostView swipe.
+    val boundarySwipe = remember { object : NestedScrollConnection {} }
+    val overscrollX = 0f
 
     val imageLoader = remember(context) {
         ImageLoader.Builder(context.applicationContext).components {

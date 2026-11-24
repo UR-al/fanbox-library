@@ -94,10 +94,14 @@ class DesktopLibraryTest {
             waitUntil(timeoutMillis = 15_000) { onAllNodesWithText("작품 B").fetchSemanticsNodes().isNotEmpty() }
             onNodeWithText("작품 B").performClick()
             onNodeWithText("작품 1/2").assertIsDisplayed()
+            // Plain DirectionRight at the last image must NOT skip to the next work
             onRoot().performKeyInput { pressKey(Key.DirectionRight) }
+            onNodeWithText("작품 1/2").assertIsDisplayed()
+            // PageDown / PageUp switches between works intentionally
+            onRoot().performKeyInput { pressKey(Key.PageDown) }
             waitUntil(timeoutMillis = 5_000) { onAllNodesWithText("작품 2/2").fetchSemanticsNodes().isNotEmpty() }
             onNodeWithText("작품 A").assertIsDisplayed()
-            onRoot().performKeyInput { pressKey(Key.DirectionLeft) }
+            onRoot().performKeyInput { pressKey(Key.PageUp) }
             waitUntil(timeoutMillis = 5_000) { onAllNodesWithText("작품 1/2").fetchSemanticsNodes().isNotEmpty() }
             onNodeWithText("작품 B").assertIsDisplayed()
         }

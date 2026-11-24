@@ -15,6 +15,7 @@ import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Compare
+import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.FolderZip
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
@@ -69,9 +70,19 @@ internal data class Preview(
     val loading: Boolean = false,
 )
 
-private val decodeThreads = Dispatchers.IO.limitedParallelism(3)
+private val decodeThreads = Dispatchers.IO.limitedParallelism(4)
 
-private fun decode(file: File, edge: Int): Preview {
+private val localPreviewCache = java.util.Collections.synchronizedMap(
+    object : LinkedHashMap<String, Preview>(48, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Preview>?): Boolean = size > 48
+    },
+)
+
+private fun cacheKey(file: File, hash: String, edge: Int) = "${file.path}|$hash|$edge"
+
+private fun decode(file: File, hash: String, edge: Int): Preview {
+    val k = cacheKey(file, hash, edge)
+    localPreviewCache[k]?.let { return it }
     if (!file.isFile) return Preview()
     ImageIO.createImageInputStream(file)?.use { stream ->
         val reader = ImageIO.getImageReaders(stream).asSequence().firstOrNull() ?: return Preview()
@@ -81,7 +92,9 @@ private fun decode(file: File, edge: Int): Preview {
             val height = reader.getHeight(0)
             val sample = ceil(max(width, height).toDouble() / edge).toInt().coerceAtLeast(1)
             val options = reader.defaultReadParam.apply { setSourceSubsampling(sample, sample, 0, 0) }
-            return Preview(reader.read(0, options).toComposeImageBitmap(), width, height)
+            val result = Preview(reader.read(0, options).toComposeImageBitmap(), width, height)
+            localPreviewCache[k] = result
+            return result
         } finally {
             reader.dispose()
         }
@@ -89,15 +102,30 @@ private fun decode(file: File, edge: Int): Preview {
     return Preview()
 }
 
+private suspend fun prefetchImage(asset: LibraryAsset, edge: Int) {
+    val file = File(asset.path)
+    val k = cacheKey(file, asset.sha256, edge)
+    if (localPreviewCache.containsKey(k)) return
+    try {
+        withContext(decodeThreads) { decode(file, asset.sha256, edge) }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+    }
+}
+
 @Composable
 internal fun loadImage(file: File, hash: String, edge: Int): Preview = key(file.path, hash, edge) {
-    val preview by produceState(Preview(loading = true)) {
-        value = try {
-            withContext(decodeThreads) { decode(file, edge) }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
-            Preview()
+    val cached = remember(file.path, hash, edge) { localPreviewCache[cacheKey(file, hash, edge)] }
+    val preview by produceState(cached ?: Preview(loading = true)) {
+        if (value.bitmap == null) {
+            value = try {
+                withContext(decodeThreads) { decode(file, hash, edge) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                Preview()
+            }
         }
     }
     preview
@@ -126,6 +154,7 @@ internal fun PostReader(
     export: (LibraryAsset) -> Unit,
     openZip: (LibraryAsset) -> Unit = {},
     openPsd: (LibraryAsset) -> Unit = {},
+    onDeleteAsset: (LibraryAsset) -> Unit = {},
 ) {
     val colors = LocalGalleryColors.current
     val allImages = remember(post) { post.assets.filter { it.isImage } }
@@ -155,6 +184,17 @@ internal fun PostReader(
     val focus = remember { FocusRequester() }
     LaunchedEffect(post.id) { focus.requestFocus() }
 
+    // Eagerly prefetch adjacent pages so flipping pages is instantaneous without stutter!
+    LaunchedEffect(post.id, active, images) {
+        if (images.isNotEmpty()) {
+            images.getOrNull(active + 1)?.let { prefetchImage(it, 2600) }
+            images.getOrNull(active - 1)?.let { prefetchImage(it, 2600) }
+            images.getOrNull(active + 2)?.let { prefetchImage(it, 2600) }
+        }
+    }
+
+    var pendingDelete by remember { mutableStateOf<LibraryAsset?>(null) }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -176,16 +216,18 @@ internal fun PostReader(
                     Key.DirectionLeft -> {
                         when {
                             jumpWorkModifier && prevPost != null -> { onSelectPost(prevPost.id); true }
-                            mode == ReaderMode.SINGLE && active > 0 -> { page = active - 1; true }
-                            prevPost != null -> { onSelectPost(prevPost.id); true }
+                            mode == ReaderMode.SINGLE -> {
+                                if (active > 0) { page = active - 1; true } else true // Never accidentally leave current work!
+                            }
                             else -> false
                         }
                     }
                     Key.DirectionRight -> {
                         when {
                             jumpWorkModifier && nextPost != null -> { onSelectPost(nextPost.id); true }
-                            mode == ReaderMode.SINGLE && active < images.lastIndex -> { page = active + 1; true }
-                            nextPost != null -> { onSelectPost(nextPost.id); true }
+                            mode == ReaderMode.SINGLE -> {
+                                if (active < images.lastIndex) { page = active + 1; true } else true // Stay on last image!
+                            }
                             else -> false
                         }
                     }
@@ -303,6 +345,7 @@ internal fun PostReader(
                     export = export,
                     openZip = openZip,
                     openPsd = openPsd,
+                    onDelete = { pendingDelete = it },
                 )
             }
             ReaderMode.WEBTOON -> {
@@ -343,12 +386,40 @@ internal fun PostReader(
                             onVariantFilter = { variantFilter = it },
                             onPageChange = { page = it },
                             onOpenExternal = { open(image) },
+                            onDeleteCurrent = { pendingDelete = image },
                             hasSiblingPosts = prevPost != null || nextPost != null,
                         )
                     }
                 }
             }
         }
+    }
+
+    pendingDelete?.let { assetToDelete ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            containerColor = colors.surface,
+            titleContentColor = colors.ink,
+            textContentColor = colors.ink,
+            title = { Text("파일 삭제") },
+            text = {
+                Text(
+                    "‘${assetToDelete.name}’ 항목을 이 작품에서 삭제할까요?\n(외부 연결 폴더의 원본 파일은 안전하게 보존되며 보관함 목록에서만 제거됩니다.)",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = colors.muted,
+                )
+            },
+            confirmButton = {
+                Button(
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                    onClick = {
+                        pendingDelete = null
+                        onDeleteAsset(assetToDelete)
+                    },
+                ) { Text("삭제") }
+            },
+            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("취소") } },
+        )
     }
 }
 
@@ -395,13 +466,17 @@ private fun ColumnScope.SingleImageStage(
     onVariantFilter: (VariantFilter) -> Unit,
     onPageChange: (Int) -> Unit,
     onOpenExternal: () -> Unit,
+    onDeleteCurrent: () -> Unit,
     hasSiblingPosts: Boolean,
 ) {
     val colors = LocalGalleryColors.current
-    val preview = loadImage(File(asset.path), asset.sha256, 4608)
     var scale by remember { mutableStateOf(1f) }
     var pan by remember { mutableStateOf(Offset.Zero) }
     var pixelScale by remember { mutableStateOf(1f) }
+    // Fast 2600px cached decode by default; seamlessly upgrades to 4608px when zoomed in!
+    val targetEdge = if (scale > 1.55f) 4608 else 2600
+    val preview = loadImage(File(asset.path), asset.sha256, targetEdge)
+    val fallbackThumb = if (preview.bitmap == null) loadImage(File(asset.path), asset.sha256, 520) else preview
 
     fun magnify(new: Float) {
         scale = new.coerceIn(1f, max(12f, pixelScale))
@@ -423,7 +498,9 @@ private fun ColumnScope.SingleImageStage(
             },
         contentAlignment = Alignment.Center,
     ) {
-        val bitmap = preview.bitmap
+        val bitmap = preview.bitmap ?: fallbackThumb.bitmap
+        val effW = if (preview.bitmap != null) preview.width else fallbackThumb.width
+        val effH = if (preview.bitmap != null) preview.height else fallbackThumb.height
         if (bitmap == null) {
             Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 if (preview.loading) {
@@ -437,10 +514,10 @@ private fun ColumnScope.SingleImageStage(
             val density = LocalDensity.current
             val viewWidth = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
             val viewHeight = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
-            val fit = min(viewWidth / preview.width, viewHeight / preview.height)
+            val fit = min(viewWidth / effW.coerceAtLeast(1), viewHeight / effH.coerceAtLeast(1))
             LaunchedEffect(fit) { pixelScale = 1f / fit }
-            val boundX = max(0f, (preview.width * fit * scale - viewWidth) / 2f)
-            val boundY = max(0f, (preview.height * fit * scale - viewHeight) / 2f)
+            val boundX = max(0f, (effW * fit * scale - viewWidth) / 2f)
+            val boundY = max(0f, (effH * fit * scale - viewHeight) / 2f)
             val translated = Offset(pan.x.coerceIn(-boundX, boundX), pan.y.coerceIn(-boundY, boundY))
 
             Box(
@@ -586,7 +663,7 @@ private fun ColumnScope.SingleImageStage(
 
             if (hasSiblingPosts) {
                 Text(
-                    "← → 페이지·작품 전환 · Ctrl+←→ 바로 작품 전환",
+                    "← → 페이지 이동 · Ctrl+←→ / PgUp·PgDn 작품 전환",
                     style = MaterialTheme.typography.labelSmall,
                     color = colors.muted,
                     modifier = Modifier.padding(start = 10.dp),
@@ -607,6 +684,14 @@ private fun ColumnScope.SingleImageStage(
             TextButton(onClick = { magnify(1f) }) { Text("맞춤") }
             TextButton(onClick = { magnify(pixelScale) }, enabled = pixelScale > 1f) { Text("1:1") }
             TextButton(onClick = onOpenExternal) { Text("원본 열기") }
+            TextButton(
+                onClick = onDeleteCurrent,
+                colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+            ) {
+                Icon(Icons.Rounded.DeleteOutline, null, Modifier.size(16.dp))
+                Spacer(Modifier.width(3.dp))
+                Text("삭제")
+            }
         }
         Text(
             "${asset.name} · ${asset.variant} · ${formatSize(asset.size)}",
@@ -899,6 +984,7 @@ private fun ColumnScope.AttachmentsPane(
     export: (LibraryAsset) -> Unit,
     openZip: (LibraryAsset) -> Unit,
     openPsd: (LibraryAsset) -> Unit,
+    onDelete: (LibraryAsset) -> Unit,
 ) {
     val colors = LocalGalleryColors.current
     if (attachments.isEmpty()) {
@@ -975,6 +1061,9 @@ private fun ColumnScope.AttachmentsPane(
                     ) {
                         Text("열기")
                     }
+                }
+                IconButton(onClick = { onDelete(asset) }) {
+                    Icon(Icons.Rounded.DeleteOutline, contentDescription = "삭제", tint = MaterialTheme.colorScheme.error)
                 }
             }
         }

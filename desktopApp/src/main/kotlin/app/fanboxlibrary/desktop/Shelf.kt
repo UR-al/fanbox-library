@@ -14,11 +14,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Collections
+import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.FolderZip
 import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.Image
+import androidx.compose.material.icons.rounded.MergeType
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.automirrored.rounded.Sort
@@ -138,12 +142,18 @@ internal fun Shelf(
     onPost: (String) -> Unit,
     onBrowse: () -> Unit,
     onLinkFolder: () -> Unit,
+    onMergeSeries: (targetId: String, sourceIds: Set<String>, seriesTitle: String) -> Unit = { _, _, _ -> },
 ) {
     val colors = LocalGalleryColors.current
     val textlessCount = remember(posts) { posts.count { it.hasTextless() } }
     val attachPostCount = remember(posts) { posts.count { it.attachmentCount() > 0 } }
     val totalImages = remember(posts) { posts.sumOf { it.imageCount() } }
     val totalAttachments = remember(posts) { posts.sumOf { it.attachmentCount() } }
+
+    var groupByArtist by remember { mutableStateOf(true) }
+    var mergeMode by remember { mutableStateOf(false) }
+    var mergeSelected by remember { mutableStateOf<List<String>>(emptyList()) }
+    var showMergeDialog by remember { mutableStateOf(false) }
 
     val bySmart = remember(posts, smartFilter) {
         when (smartFilter) {
@@ -277,6 +287,17 @@ internal fun Shelf(
             ) {
                 Column(Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        if (activeArtist != null) {
+                            OutlinedButton(
+                                onClick = { onCreator(null) },
+                                shape = RoundedCornerShape(9.dp),
+                                border = BorderStroke(1.dp, colors.border),
+                                contentPadding = PaddingValues(horizontal = 9.dp, vertical = 4.dp),
+                            ) {
+                                Icon(Icons.Rounded.ChevronLeft, null, Modifier.size(16.dp))
+                                Text("모든 작가", style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
                         Text(
                             activeArtist ?: smartFilter.label,
                             style = MaterialTheme.typography.headlineSmall,
@@ -304,6 +325,57 @@ internal fun Shelf(
                             style = MaterialTheme.typography.bodySmall,
                             color = colors.muted,
                         )
+                    }
+                }
+
+                // 1차 작가별 / 전체 작품 토글 (작가가 2명 이상일 때)
+                if (activeArtist == null && groups.size > 1) {
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(colors.surface)
+                            .border(1.dp, colors.border, RoundedCornerShape(10.dp))
+                            .padding(3.dp),
+                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        ShelfFilter("작가별", groupByArtist) { groupByArtist = true; mergeMode = false; mergeSelected = emptyList() }
+                        ShelfFilter("전체", !groupByArtist) { groupByArtist = false }
+                    }
+                }
+
+                // 시리즈 합치기 토글 (게시글 목록 뷰일 때)
+                val showingArtistFolders = activeArtist == null && groupByArtist && query.isBlank() && groups.size > 1
+                if (!showingArtistFolders && visiblePosts.size >= 2) {
+                    OutlinedButton(
+                        onClick = {
+                            if (mergeMode && mergeSelected.size >= 2) {
+                                showMergeDialog = true
+                            } else {
+                                mergeMode = !mergeMode
+                                mergeSelected = emptyList()
+                            }
+                        },
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, if (mergeMode) colors.accent else colors.border),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = if (mergeMode) colors.accentSoft else Color.Transparent,
+                        ),
+                        contentPadding = PaddingValues(horizontal = 11.dp, vertical = 6.dp),
+                    ) {
+                        Icon(Icons.Rounded.MergeType, null, Modifier.size(16.dp), tint = if (mergeMode) colors.accent else colors.muted)
+                        Spacer(Modifier.width(5.dp))
+                        Text(
+                            when {
+                                !mergeMode -> "시리즈 합치기"
+                                mergeSelected.size >= 2 -> "${mergeSelected.size}개 합치기"
+                                else -> "취소"
+                            },
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (mergeMode) colors.accent else colors.ink,
+                        )
+                    }
+                    if (mergeMode && mergeSelected.isNotEmpty()) {
+                        TextButton(onClick = { mergeMode = false; mergeSelected = emptyList() }) { Text("취소") }
                     }
                 }
 
@@ -412,6 +484,7 @@ internal fun Shelf(
 
             Spacer(Modifier.height(14.dp))
 
+            val showingArtistFolders = activeArtist == null && groupByArtist && query.isBlank() && groups.size > 1
             if (visiblePosts.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Column(
@@ -451,6 +524,24 @@ internal fun Shelf(
                         }
                     }
                 }
+            } else if (showingArtistFolders) {
+                val artistBuckets = remember(visiblePosts) {
+                    visiblePosts.groupBy { it.artistLabel() }.entries.sortedBy { it.key.lowercase() }
+                }
+                LazyVerticalGrid(
+                    columns = GridCells.Adaptive(if (largeGrid) 260.dp else 210.dp),
+                    verticalArrangement = Arrangement.spacedBy(18.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    contentPadding = PaddingValues(bottom = 28.dp),
+                ) {
+                    items(artistBuckets, key = { it.key }) { (artistName, artistPosts) ->
+                        ArtistFolderCard(
+                            artistName = artistName,
+                            artistPosts = artistPosts,
+                            onClick = { onCreator(artistName) },
+                        )
+                    }
+                }
             } else {
                 LazyVerticalGrid(
                     columns = GridCells.Adaptive(if (largeGrid) 248.dp else 192.dp),
@@ -459,11 +550,66 @@ internal fun Shelf(
                     contentPadding = PaddingValues(bottom = 28.dp),
                 ) {
                     items(visiblePosts, key = { it.id }) { post ->
-                        CoverCard(post) { onPost(post.id) }
+                        val isSelectedForMerge = post.id in mergeSelected
+                        CoverCard(
+                            post = post,
+                            mergeMode = mergeMode,
+                            selectedForMerge = isSelectedForMerge,
+                            onClick = {
+                                if (mergeMode) {
+                                    mergeSelected = if (isSelectedForMerge) mergeSelected - post.id else mergeSelected + post.id
+                                } else {
+                                    onPost(post.id)
+                                }
+                            },
+                        )
                     }
                 }
             }
         }
+    }
+
+    if (showMergeDialog && mergeSelected.size >= 2) {
+        val targetId = mergeSelected.first()
+        val firstPost = visiblePosts.firstOrNull { it.id == targetId }
+        var seriesTitle by remember(mergeSelected) { mutableStateOf(firstPost?.titleLabel().orEmpty()) }
+        AlertDialog(
+            onDismissRequest = { showMergeDialog = false },
+            containerColor = colors.surface,
+            titleContentColor = colors.ink,
+            textContentColor = colors.ink,
+            title = { Text("시리즈로 합치기 (${mergeSelected.size}개 작품)") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "선택한 ${mergeSelected.size}개 작품의 모든 이미지와 첨부파일을 하나의 시리즈 폴더로 통합합니다.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.muted,
+                    )
+                    OutlinedTextField(
+                        value = seriesTitle,
+                        onValueChange = { seriesTitle = it },
+                        label = { Text("통합 시리즈 제목") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp),
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = seriesTitle.isNotBlank(),
+                    onClick = {
+                        val sources = mergeSelected.drop(1).toSet()
+                        showMergeDialog = false
+                        mergeMode = false
+                        mergeSelected = emptyList()
+                        onMergeSeries(targetId, sources, seriesTitle.trim())
+                    },
+                ) { Text("하나로 합치기") }
+            },
+            dismissButton = { TextButton(onClick = { showMergeDialog = false }) { Text("취소") } },
+        )
     }
 }
 
@@ -589,7 +735,74 @@ internal fun ShelfFilter(label: String, selected: Boolean, onClick: () -> Unit) 
 }
 
 @Composable
-private fun CoverCard(post: LibraryPost, onClick: () -> Unit) {
+private fun ArtistFolderCard(
+    artistName: String,
+    artistPosts: List<LibraryPost>,
+    onClick: () -> Unit,
+) {
+    val colors = LocalGalleryColors.current
+    val interaction = remember { MutableInteractionSource() }
+    val hovered by interaction.collectIsHoveredAsState()
+    val coverAsset = remember(artistPosts) {
+        artistPosts.firstNotNullOfOrNull { p -> p.assets.firstOrNull { it.isImage } }
+    }
+    val totalImgs = remember(artistPosts) { artistPosts.sumOf { it.imageCount() } }
+    val avatarColor = remember(artistName) { artistColor(artistName) }
+
+    Column(
+        modifier = Modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(colors.surface)
+            .border(if (hovered) 1.5.dp else 1.dp, if (hovered) colors.accent else colors.border, RoundedCornerShape(14.dp))
+            .hoverable(interaction)
+            .clickable(onClick = onClick),
+    ) {
+        Box(
+            modifier = Modifier.fillMaxWidth().aspectRatio(1.1f).background(colors.surfaceElevated),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (coverAsset != null) {
+                val preview = loadImage(File(coverAsset.path), coverAsset.sha256, 480)
+                if (preview.bitmap != null) {
+                    Image(preview.bitmap, artistName, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, alignment = Alignment.TopCenter)
+                }
+            } else {
+                Icon(Icons.Rounded.Folder, null, tint = avatarColor, modifier = Modifier.size(44.dp))
+            }
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(10.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xCC0E1016))
+                    .padding(horizontal = 9.dp, vertical = 4.dp),
+            ) {
+                Text("작품 ${artistPosts.size}개 · 이미지 ${totalImgs}장", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 11.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(9.dp),
+        ) {
+            Box(
+                modifier = Modifier.size(28.dp).clip(CircleShape).background(avatarColor.copy(alpha = 0.22f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(artistName.take(1).uppercase(), fontSize = 12.sp, fontWeight = FontWeight.Bold, color = avatarColor)
+            }
+            Text(artistName, style = MaterialTheme.typography.titleSmall, color = colors.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+    }
+}
+
+@Composable
+private fun CoverCard(
+    post: LibraryPost,
+    mergeMode: Boolean = false,
+    selectedForMerge: Boolean = false,
+    onClick: () -> Unit,
+) {
     val colors = LocalGalleryColors.current
     val interactionSource = remember { MutableInteractionSource() }
     val hovered by interactionSource.collectIsHoveredAsState()
@@ -606,8 +819,8 @@ private fun CoverCard(post: LibraryPost, onClick: () -> Unit) {
             .clip(RoundedCornerShape(14.dp))
             .background(colors.surface)
             .border(
-                width = if (hovered) 1.5.dp else 1.dp,
-                color = if (hovered) colors.accent else colors.border,
+                width = if (selectedForMerge || hovered) 2.dp else 1.dp,
+                color = if (selectedForMerge || hovered) colors.accent else colors.border,
                 shape = RoundedCornerShape(14.dp),
             )
             .hoverable(interactionSource)
@@ -688,7 +901,7 @@ private fun CoverCard(post: LibraryPost, onClick: () -> Unit) {
                 }
             }
 
-            // Bottom attachment badge
+            // Bottom attachment badge & merge checkbox
             if (attachCount > 0) {
                 Box(
                     modifier = Modifier
@@ -699,6 +912,23 @@ private fun CoverCard(post: LibraryPost, onClick: () -> Unit) {
                         text = "PSD·첨부 $attachCount",
                         bg = Color(0xCC4F46E5),
                         fg = Color.White,
+                    )
+                }
+            }
+            if (mergeMode) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(8.dp)
+                        .clip(CircleShape)
+                        .background(if (selectedForMerge) colors.accent else Color(0xAA0E1016))
+                        .padding(4.dp),
+                ) {
+                    Icon(
+                        Icons.Rounded.CheckCircle,
+                        contentDescription = null,
+                        tint = if (selectedForMerge) Color.White else Color.White.copy(alpha = 0.45f),
+                        modifier = Modifier.size(18.dp),
                     )
                 }
             }

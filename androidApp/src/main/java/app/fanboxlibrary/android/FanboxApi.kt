@@ -87,10 +87,12 @@ internal data class FanboxPostSummary(
     val hasAdultContent: Boolean,
     val likeCount: Int,
     val type: String,
+    val tags: List<String> = emptyList(),
 ) {
     val year: Int? get() = publishedDatetime.take(4).toIntOrNull()
     val postUrl: String get() = "https://${creatorId.ifBlank { "www" }}.fanbox.cc/posts/$id"
     val displayDate: String get() = publishedDatetime.take(10)
+    val isTextOnly: Boolean get() = type.equals("text", true) || (coverImageUrl.isNullOrBlank() && type != "image" && type != "file")
 }
 
 internal data class FanboxPostDetail(
@@ -393,7 +395,7 @@ internal object FanboxClient {
 
     suspend fun setFollowCreator(context: Context, creatorUserId: String, follow: Boolean): FanboxResult<Boolean> {
         if (creatorUserId.isBlank()) return FanboxResult.Error("작가 ID 정보를 불러오지 못했습니다.")
-        val endpoint = if (follow) "creator.follow" else "creator.unfollow"
+        val endpoint = if (follow) "follow.create" else "follow.delete"
         val payload = JSONObject().put("creatorUserId", creatorUserId).toString()
         return requestJson(
             context = context,
@@ -401,6 +403,19 @@ internal object FanboxClient {
             method = "POST",
             jsonBody = payload,
         ) { follow }
+    }
+
+    suspend fun fetchRecommendedCreators(context: Context): FanboxResult<List<FanboxCreator>> {
+        return requestJson(context, "${FanboxSession.API_BASE}/creator.listRecommended?limit=20") { root ->
+            val arr = root.optJSONObject("body")?.optJSONArray("creators")
+                ?: root.optJSONArray("body")
+                ?: JSONArray()
+            buildList {
+                for (i in 0 until arr.length()) {
+                    arr.optJSONObject(i)?.let(::parseCreatorObject)?.let(::add)
+                }
+            }
+        }
     }
 
     /**

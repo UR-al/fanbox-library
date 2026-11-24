@@ -67,7 +67,9 @@ import app.fanboxlibrary.shared.FanboxLinks
 import app.fanboxlibrary.shared.ImportSource
 import app.fanboxlibrary.shared.LibraryPost
 import app.fanboxlibrary.shared.LibraryStore
+import app.fanboxlibrary.shared.PasswordExtractor
 import app.fanboxlibrary.shared.PostDraft
+import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -91,6 +93,12 @@ private enum class ServiceFilter(val label: String) {
     FANBOX("FANBOX"),
     PATREON("Patreon"),
 }
+
+private class QueuedDownloadTask(
+    val id: String = UUID.randomUUID().toString(),
+    val label: String,
+    val run: suspend (updateProgress: (String) -> Unit) -> Unit,
+)
 
 private val fanboxUiPrefs: Preferences = Preferences.userRoot().node("app/fanboxlibrary/desktop/fanbox_ui")
 
@@ -140,10 +148,13 @@ internal fun DesktopFanboxHub(
     var searchError by remember { mutableStateOf<DesktopFanboxResult<Nothing>?>(null) }
     var hasSearched by remember { mutableStateOf(false) }
 
-    // Detail & batch saving state
+    // Detail & non-blocking download queue state
     var activePost by remember { mutableStateOf<DesktopFanboxPostSummary?>(null) }
     var savingJob by remember { mutableStateOf<Job?>(null) }
     var savingProgress by remember { mutableStateOf("") }
+    val downloadQueue = remember { mutableStateListOf<QueuedDownloadTask>() }
+    var activeQueueTask by remember { mutableStateOf<QueuedDownloadTask?>(null) }
+    var showQueuePanel by remember { mutableStateOf(false) }
     val resolvedRewardsMap = remember { mutableStateMapOf<String, List<ResolvedRewardItem>>() }
 
     val archivedMap = remember(libraryPosts) {
@@ -349,58 +360,122 @@ internal fun DesktopFanboxHub(
         }
     }
 
-    fun saveSinglePost(detail: DesktopFanboxPostDetail) {
-        val activeStore = store ?: return
+    fun startQueueWorkerIfIdle() {
         if (savingJob?.isActive == true) return
-        val targets = buildList<Pair<String, String>> {
-            detail.images.forEachIndexed { idx, img -> add("%02d_${img.fileName}".format(idx + 1) to img.originalUrl) }
-            detail.files.forEach { f -> add(f.fileName to f.url) }
-        }
-        if (targets.isEmpty()) return
         savingJob = scope.launch {
-            var added = 0
-            var reused = 0
             try {
-                val draft = PostDraft(
-                    creator = detail.summary.creatorName,
-                    title = detail.summary.title,
-                    year = detail.summary.year,
-                    sourceUrl = detail.summary.postUrl,
-                )
-                for ((i, pair) in targets.withIndex()) {
-                    if (!isActive) throw CancellationException()
-                    val (fileName, url) = pair
-                    savingProgress = "저장 중 (${i + 1}/${targets.size}) · $fileName"
-                    val report = withContext(Dispatchers.IO) {
-                        val stream = if (detail.summary.service == FeedService.PATREON) {
-                            DesktopPatreonClient.openDownloadStream(url)
-                        } else {
-                            DesktopFanboxClient.openDownloadStream(url)
+                while (downloadQueue.isNotEmpty() && isActive) {
+                    val nextTask = downloadQueue.removeAt(0)
+                    activeQueueTask = nextTask
+                    savingProgress = "${nextTask.label} 준비 중…"
+                    try {
+                        nextTask.run { msg ->
+                            val qSuffix = if (downloadQueue.isNotEmpty()) " [대기 ${downloadQueue.size}건]" else ""
+                            savingProgress = "$msg$qSuffix"
                         }
-                        stream.use { input ->
-                            activeStore.importManaged(draft, listOf(ImportSource(fileName, "원본/$fileName") { input }))
-                        }
+                    } catch (_: CancellationException) {
+                        throw CancellationException()
+                    } catch (e: Exception) {
+                        onLibraryUpdated("[${nextTask.label}] 오류: ${e.localizedMessage ?: e.javaClass.simpleName}")
                     }
-                    added += report.added
-                    reused += report.reused
                 }
-                onLibraryUpdated("내 보관함에 저장 완료 · 추가 ${added}개 · 기존 ${reused}개")
             } catch (_: CancellationException) {
-                onLibraryUpdated("저장을 중단했습니다. (지금까지 추가 ${added}개)")
-            } catch (e: Exception) {
-                onLibraryUpdated("저장 실패: ${e.localizedMessage ?: e.javaClass.simpleName}")
+                onLibraryUpdated("다운로드 작업을 중단했습니다.")
             } finally {
+                activeQueueTask = null
                 savingProgress = ""
                 savingJob = null
             }
         }
     }
 
+    fun enqueueDownload(label: String, block: suspend (updateProgress: (String) -> Unit) -> Unit) {
+        downloadQueue.add(QueuedDownloadTask(label = label, run = block))
+        if (savingJob?.isActive == true) {
+            onLibraryUpdated("대기열 추가: $label (대기 ${downloadQueue.size}건)")
+        } else {
+            startQueueWorkerIfIdle()
+        }
+    }
+
+    fun saveSinglePost(detail: DesktopFanboxPostDetail) {
+        val activeStore = store ?: return
+        val targets = buildList<Pair<String, String>> {
+            detail.images.forEachIndexed { idx, img -> add("%02d_${img.fileName}".format(idx + 1) to img.originalUrl) }
+            detail.files.forEach { f -> add(f.fileName to f.url) }
+        }
+        if (targets.isEmpty()) return
+        val passwords = PasswordExtractor.extractCandidates(detail.text)
+        enqueueDownload("${detail.summary.creatorName} · ${detail.summary.title}") { updateProgress ->
+            var added = 0
+            var reused = 0
+            val draft = PostDraft(
+                creator = detail.summary.creatorName,
+                title = detail.summary.title,
+                year = detail.summary.year,
+                sourceUrl = detail.summary.postUrl,
+            )
+            for ((i, pair) in targets.withIndex()) {
+                val (fileName, url) = pair
+                updateProgress("저장 중 (${i + 1}/${targets.size}) · $fileName")
+                val report = withContext(Dispatchers.IO) {
+                    ExternalRewardDownloader.ingestAttachmentWithSmartUnpack(
+                        store = activeStore,
+                        draft = draft,
+                        fileName = fileName,
+                        passwordCandidates = passwords,
+                        openStream = {
+                            if (detail.summary.service == FeedService.PATREON) DesktopPatreonClient.openDownloadStream(url)
+                            else DesktopFanboxClient.openDownloadStream(url)
+                        },
+                        onProgress = updateProgress,
+                    )
+                }
+                added += report.added
+                reused += report.reused
+            }
+            onLibraryUpdated("[${detail.summary.title}] 저장 완료 · 추가 ${added}개 · 기존 ${reused}개")
+        }
+    }
+
     fun saveResolvedRewards(detail: DesktopFanboxPostDetail, rewards: List<ResolvedRewardItem>) {
         val activeStore = store ?: return
-        if (savingJob?.isActive == true || rewards.isEmpty()) return
-        savingJob = scope.launch {
-            try {
+        if (rewards.isEmpty()) return
+        val passwords = PasswordExtractor.extractCandidates(detail.text)
+        enqueueDownload("${detail.summary.creatorName} · 외부 보상 (${rewards.size}개)") { updateProgress ->
+            val draft = PostDraft(
+                creator = detail.summary.creatorName,
+                title = detail.summary.title,
+                year = detail.summary.year,
+                sourceUrl = detail.summary.postUrl,
+            )
+            val rep = ExternalRewardDownloader.downloadAndImportRewards(
+                store = activeStore,
+                draft = draft,
+                rewards = rewards,
+                passwordCandidates = passwords,
+                onProgress = updateProgress,
+            )
+            onLibraryUpdated("[${detail.summary.title}] 외부 보상 저장 완료 · 추가 ${rep.added}개 · 기존 ${rep.reused}개")
+        }
+    }
+
+    fun oneClickExternalLink(detail: DesktopFanboxPostDetail, link: DesktopPostExternalLink) {
+        val activeStore = store ?: return
+        val passwords = PasswordExtractor.extractCandidates(detail.text)
+        enqueueDownload("${detail.summary.creatorName} · ${link.label}") { updateProgress ->
+            val resolvedRes = ExternalRewardDownloader.resolveRewardLink(link, updateProgress)
+            val rewards = resolvedRes.getOrElse { err ->
+                onLibraryUpdated("보상 링크 확인 실패: ${err.localizedMessage ?: err.javaClass.simpleName}")
+                return@enqueueDownload
+            }
+            if (rewards.isEmpty()) {
+                onLibraryUpdated("보상 페이지에서 다운로드 링크를 찾지 못했습니다.")
+                return@enqueueDownload
+            }
+            resolvedRewardsMap[link.url] = rewards
+
+            if (rewards.size == 1) {
                 val draft = PostDraft(
                     creator = detail.summary.creatorName,
                     title = detail.summary.title,
@@ -411,64 +486,12 @@ internal fun DesktopFanboxHub(
                     store = activeStore,
                     draft = draft,
                     rewards = rewards,
-                    onProgress = { msg -> savingProgress = msg },
+                    passwordCandidates = passwords,
+                    onProgress = updateProgress,
                 )
-                onLibraryUpdated("외부 보상 저장 완료 · 추가 ${rep.added}개 · 기존 ${rep.reused}개")
-            } catch (_: CancellationException) {
-                onLibraryUpdated("외부 보상 다운로드를 중단했습니다.")
-            } catch (e: Exception) {
-                onLibraryUpdated("외부 보상 저장 실패: ${e.localizedMessage ?: e.javaClass.simpleName}")
-            } finally {
-                savingProgress = ""
-                savingJob = null
-            }
-        }
-    }
-
-    fun oneClickExternalLink(detail: DesktopFanboxPostDetail, link: DesktopPostExternalLink) {
-        val activeStore = store ?: return
-        if (savingJob?.isActive == true) return
-        savingJob = scope.launch {
-            try {
-                val resolvedRes = ExternalRewardDownloader.resolveRewardLink(link) { msg ->
-                    savingProgress = msg
-                }
-                val rewards = resolvedRes.getOrElse { err ->
-                    onLibraryUpdated("보상 링크 확인 실패: ${err.localizedMessage ?: err.javaClass.simpleName}")
-                    return@launch
-                }
-                if (rewards.isEmpty()) {
-                    onLibraryUpdated("보상 페이지에서 다운로드 링크를 찾지 못했습니다.")
-                    return@launch
-                }
-                resolvedRewardsMap[link.url] = rewards
-
-                // If exactly 1 reward was found, download & unpack into Library immediately in 1 click!
-                // If multiple packs exist on a monthly hub page (e.g. Deluxe Sketch + Comic PSD), show them inline so the user can pick 1 or save all!
-                if (rewards.size == 1) {
-                    val draft = PostDraft(
-                        creator = detail.summary.creatorName,
-                        title = detail.summary.title,
-                        year = detail.summary.year,
-                        sourceUrl = detail.summary.postUrl,
-                    )
-                    val rep = ExternalRewardDownloader.downloadAndImportRewards(
-                        store = activeStore,
-                        draft = draft,
-                        rewards = rewards,
-                        onProgress = { msg -> savingProgress = msg },
-                    )
-                    onLibraryUpdated("원클릭 보상 저장 완료 · 추가 ${rep.added}개 · 기존 ${rep.reused}개")
-                } else {
-                    onLibraryUpdated("보상 링크 ${rewards.size}개를 잠금 해제했습니다. 원하는 항목을 클릭해 바로 저장하세요!")
-                }
-            } catch (_: CancellationException) {
-                onLibraryUpdated("보상 인증 및 다운로드를 중단했습니다.")
-            } catch (e: Exception) {
-                onLibraryUpdated("원클릭 저장 오류: ${e.localizedMessage ?: e.javaClass.simpleName}")
-            } finally {
-                savingProgress = ""
-                savingJob = null
+                onLibraryUpdated("[${detail.summary.title}] 원클릭 보상 저장 완료 · 추가 ${rep.added}개 · 기존 ${rep.reused}개")
+            } else {
+                onLibraryUpdated("보상 링크 ${rewards.size}개를 잠금 해제했습니다. 원하는 항목을 클릭해 바로 저장하세요!")
             }
         }
     }
@@ -519,83 +542,125 @@ internal fun DesktopFanboxHub(
     }
 
     /**
-     * One-click batch archival of ALL accessible posts for a supported creator across ALL years (2026 ~ debut)!
+     * Batch archival for a creator (either ALL posts back to debut, or ONLY unarchived new posts!).
      */
-    fun saveAllCreatorPosts(creator: DesktopFanboxCreator) {
+    fun saveCreatorPostsBatch(creator: DesktopFanboxCreator, onlyUnarchived: Boolean) {
         val activeStore = store ?: return
-        if (savingJob?.isActive == true) return
-        savingJob = scope.launch {
+        val modeLabel = if (onlyUnarchived) "새 게시물만 저장" else "모든 게시물 저장"
+        enqueueDownload("[${creator.name}] $modeLabel") { updateProgress ->
+            val currentArchivedKeys = withContext(Dispatchers.IO) {
+                buildSet {
+                    activeStore.posts().forEach { p ->
+                        FanboxLinks.postId(p.sourceUrl)?.let { add("FANBOX:$it") }
+                        FanboxLinks.patreonPostId(p.sourceUrl)?.let { add("PATREON:$it") }
+                    }
+                }
+            }
+
             var totalAdded = 0
             var totalReused = 0
             var postsDone = 0
-            try {
-                savingProgress = "[${creator.name}] 전체 연도 게시물 목록을 수집하는 중…"
-                val allPosts = mutableListOf<DesktopFanboxPostSummary>()
-                val seenPostIds = hashSetOf<String>()
-                var nextUrl: String? = null
-                var pageGuard = 0
-                while (pageGuard++ < 500) {
-                    if (!isActive) throw CancellationException()
-                    val res = withContext(Dispatchers.IO) {
-                        if (creator.service == FeedService.PATREON) {
-                            DesktopPatreonClient.fetchCampaignPosts(creator.creatorId, nextUrl)
+            updateProgress("[${creator.name}] 게시물 목록을 확인하는 중…")
+            val allPosts = mutableListOf<DesktopFanboxPostSummary>()
+            val seenPostIds = hashSetOf<String>()
+            var nextUrl: String? = null
+            var pageGuard = 0
+            var archivedStreak = 0
+
+            while (pageGuard++ < 500) {
+                val res = withContext(Dispatchers.IO) {
+                    if (creator.service == FeedService.PATREON) {
+                        DesktopPatreonClient.fetchCampaignPosts(creator.creatorId, nextUrl)
+                    } else {
+                        DesktopFanboxClient.fetchCreatorPosts(creator.creatorId, nextUrl)
+                    }
+                }
+                if (res is DesktopFanboxResult.Success) {
+                    val rawNew = res.data.items.filter { seenPostIds.add(it.id) }
+                    if (rawNew.isEmpty()) break
+                    for (item in rawNew) {
+                        if (item.isRestricted) continue
+                        if (onlyUnarchived && item.uniqueKey in currentArchivedKeys) {
+                            archivedStreak++
                         } else {
-                            DesktopFanboxClient.fetchCreatorPosts(creator.creatorId, nextUrl)
+                            archivedStreak = 0
+                            allPosts.add(item)
                         }
                     }
-                    if (res is DesktopFanboxResult.Success) {
-                        val rawNew = res.data.items.filter { seenPostIds.add(it.id) }
-                        if (rawNew.isEmpty()) break
-                        allPosts.addAll(rawNew.filterNot { it.isRestricted })
-                        nextUrl = res.data.nextUrl
-                        val oldestYear = allPosts.mapNotNull { it.year }.minOrNull()
-                        val yearNote = if (oldestYear != null) " · ~${oldestYear}년" else ""
-                        savingProgress = "[${creator.name}] 게시물 목록 수집 중… (${allPosts.size}개 발견$yearNote)"
-                        if (nextUrl == null) break
-                    } else break
+                    // When incrementally syncing new posts only, stop scanning ancient years once 20 consecutive archived posts are seen
+                    if (onlyUnarchived && archivedStreak >= 20 && allPosts.isNotEmpty()) break
+                    nextUrl = res.data.nextUrl
+                    val oldestYear = allPosts.mapNotNull { it.year }.minOrNull()
+                    val yearNote = if (oldestYear != null) " · ~${oldestYear}년" else ""
+                    updateProgress("[${creator.name}] 대상 수집 중… (${allPosts.size}개 발견$yearNote)")
+                    if (nextUrl == null) break
+                } else break
+            }
+
+            if (allPosts.isEmpty()) {
+                onLibraryUpdated(if (onlyUnarchived) "[${creator.name}] 새로 올라온 미보관 게시물이 없습니다." else "[${creator.name}] 저장 가능한 게시물이 없습니다.")
+                return@enqueueDownload
+            }
+
+            val downloadedRewardUrls = hashSetOf<String>()
+            for ((pIdx, summary) in allPosts.withIndex()) {
+                updateProgress("[${creator.name}] ${pIdx + 1}/${allPosts.size} (${summary.displayDate}) · ${summary.title}")
+                val detailRes = withContext(Dispatchers.IO) {
+                    if (summary.service == FeedService.PATREON) DesktopPatreonClient.fetchPostDetail(summary.id)
+                    else DesktopFanboxClient.fetchPostDetail(summary.id)
+                }
+                val detail = (detailRes as? DesktopFanboxResult.Success)?.data ?: continue
+                val passwords = PasswordExtractor.extractCandidates(detail.text)
+                val targets = buildList<Pair<String, String>> {
+                    detail.images.forEachIndexed { i, img -> add("%02d_${img.fileName}".format(i + 1) to img.originalUrl) }
+                    detail.files.forEach { f -> add(f.fileName to f.url) }
+                }
+                val draft = PostDraft(
+                    creator = detail.summary.creatorName,
+                    title = detail.summary.title,
+                    year = detail.summary.year,
+                    sourceUrl = detail.summary.postUrl,
+                )
+
+                var touchedThisPost = false
+                for ((fIdx, pair) in targets.withIndex()) {
+                    val (fileName, url) = pair
+                    updateProgress("[${creator.name}] ${pIdx + 1}/${allPosts.size} (${fIdx + 1}/${targets.size}) · $fileName")
+                    runCatching {
+                        withContext(Dispatchers.IO) {
+                            ExternalRewardDownloader.ingestAttachmentWithSmartUnpack(
+                                store = activeStore,
+                                draft = draft,
+                                fileName = fileName,
+                                passwordCandidates = passwords,
+                                openStream = {
+                                    if (summary.service == FeedService.PATREON) DesktopPatreonClient.openDownloadStream(url)
+                                    else DesktopFanboxClient.openDownloadStream(url)
+                                },
+                                onProgress = updateProgress,
+                            )
+                        }
+                    }.onSuccess { rep ->
+                        totalAdded += rep.added
+                        totalReused += rep.reused
+                        touchedThisPost = true
+                    }
                 }
 
-                if (allPosts.isEmpty()) {
-                    onLibraryUpdated("[${creator.name}] 저장 가능한 게시물이 없습니다.")
-                    return@launch
-                }
-
-                val downloadedRewardUrls = hashSetOf<String>()
-
-                for ((pIdx, summary) in allPosts.withIndex()) {
-                    if (!isActive) throw CancellationException()
-                    savingProgress = "[${creator.name}] ${pIdx + 1}/${allPosts.size} (${summary.displayDate}) · ${summary.title} 확인 중…"
-                    val detailRes = withContext(Dispatchers.IO) {
-                        if (summary.service == FeedService.PATREON) DesktopPatreonClient.fetchPostDetail(summary.id)
-                        else DesktopFanboxClient.fetchPostDetail(summary.id)
-                    }
-                    val detail = (detailRes as? DesktopFanboxResult.Success)?.data ?: continue
-                    val targets = buildList<Pair<String, String>> {
-                        detail.images.forEachIndexed { i, img -> add("%02d_${img.fileName}".format(i + 1) to img.originalUrl) }
-                        detail.files.forEach { f -> add(f.fileName to f.url) }
-                    }
-                    val draft = PostDraft(
-                        creator = detail.summary.creatorName,
-                        title = detail.summary.title,
-                        year = detail.summary.year,
-                        sourceUrl = detail.summary.postUrl,
-                    )
-
-                    var touchedThisPost = false
-                    for ((fIdx, pair) in targets.withIndex()) {
-                        if (!isActive) throw CancellationException()
-                        val (fileName, url) = pair
-                        savingProgress = "[${creator.name}] ${pIdx + 1}/${allPosts.size} (${fIdx + 1}/${targets.size}) · $fileName"
+                for (extLink in detail.externalLinks) {
+                    val resolved = ExternalRewardDownloader.resolveRewardLink(extLink) { st ->
+                        updateProgress("[${creator.name}] ${pIdx + 1}/${allPosts.size} · $st")
+                    }.getOrNull().orEmpty()
+                    val freshRewards = resolved.filter { downloadedRewardUrls.add(it.directDownloadUrl) }
+                    if (freshRewards.isNotEmpty()) {
                         runCatching {
-                            withContext(Dispatchers.IO) {
-                                val stream = if (summary.service == FeedService.PATREON) {
-                                    DesktopPatreonClient.openDownloadStream(url)
-                                } else {
-                                    DesktopFanboxClient.openDownloadStream(url)
-                                }
-                                stream.use { input ->
-                                    activeStore.importManaged(draft, listOf(ImportSource(fileName, "원본/$fileName") { input }))
-                                }
+                            ExternalRewardDownloader.downloadAndImportRewards(
+                                store = activeStore,
+                                draft = draft,
+                                rewards = freshRewards,
+                                passwordCandidates = passwords,
+                            ) { st ->
+                                updateProgress("[${creator.name}] ${pIdx + 1}/${allPosts.size} · $st")
                             }
                         }.onSuccess { rep ->
                             totalAdded += rep.added
@@ -603,42 +668,46 @@ internal fun DesktopFanboxHub(
                             touchedThisPost = true
                         }
                     }
-
-                    // Also resolve & download external Dropbox / Google Drive / gate links if present!
-                    for (extLink in detail.externalLinks) {
-                        if (!isActive) throw CancellationException()
-                        val resolved = ExternalRewardDownloader.resolveRewardLink(extLink) { st ->
-                            savingProgress = "[${creator.name}] ${pIdx + 1}/${allPosts.size} · $st"
-                        }.getOrNull().orEmpty()
-                        val freshRewards = resolved.filter { downloadedRewardUrls.add(it.directDownloadUrl) }
-                        if (freshRewards.isNotEmpty()) {
-                            runCatching {
-                                ExternalRewardDownloader.downloadAndImportRewards(
-                                    store = activeStore,
-                                    draft = draft,
-                                    rewards = freshRewards,
-                                ) { st ->
-                                    savingProgress = "[${creator.name}] ${pIdx + 1}/${allPosts.size} · $st"
-                                }
-                            }.onSuccess { rep ->
-                                totalAdded += rep.added
-                                totalReused += rep.reused
-                                touchedThisPost = true
-                            }
-                        }
-                    }
-
-                    if (touchedThisPost) postsDone++
                 }
-                onLibraryUpdated("[${creator.name}] 전체 연도 일괄 저장 완료 · ${postsDone}작품 · 추가 ${totalAdded}개 · 기존 ${totalReused}개")
-            } catch (_: CancellationException) {
-                onLibraryUpdated("[${creator.name}] 일괄 저장 중단됨 · ${postsDone}작품 · 추가 ${totalAdded}개")
-            } catch (e: Exception) {
-                onLibraryUpdated("일괄 저장 오류: ${e.localizedMessage ?: e.javaClass.simpleName}")
-            } finally {
-                savingProgress = ""
-                savingJob = null
+                if (touchedThisPost) postsDone++
             }
+            onLibraryUpdated("[${creator.name}] $modeLabel 완료 · ${postsDone}작품 · 추가 ${totalAdded}개 · 기존 ${totalReused}개")
+        }
+    }
+
+    fun saveAllCreatorPosts(creator: DesktopFanboxCreator) = saveCreatorPostsBatch(creator, onlyUnarchived = false)
+
+    /**
+     * #1 One-click Incremental Sync across ALL supported FANBOX & Patreon creators!
+     */
+    fun syncAllSupportingNewPosts() {
+        if (!fanboxLoggedIn && !patreonLoggedIn) {
+            onLibraryUpdated("먼저 FANBOX 또는 Patreon 계정에 로그인해 주세요.")
+            return
+        }
+        enqueueDownload("후원 작가 전체 · 미보관 새 보상 일괄 수령") { updateProgress ->
+            updateProgress("후원 중인 FANBOX · Patreon 작가 목록을 확인하는 중…")
+            val supCreators = mutableListOf<DesktopFanboxCreator>()
+            withContext(Dispatchers.IO) {
+                if (fanboxLoggedIn) {
+                    (DesktopFanboxClient.fetchCreators() as? DesktopFanboxResult.Success)?.data
+                        ?.filter { it.isSupporting }
+                        ?.let(supCreators::addAll)
+                }
+                if (patreonLoggedIn) {
+                    (DesktopPatreonClient.fetchSupportingCreators() as? DesktopFanboxResult.Success)?.data
+                        ?.filter { it.isSupporting }
+                        ?.let(supCreators::addAll)
+                }
+            }
+            if (supCreators.isEmpty()) {
+                onLibraryUpdated("현재 후원 중인 작가를 찾지 못했습니다.")
+                return@enqueueDownload
+            }
+            supCreators.forEach { cr ->
+                saveCreatorPostsBatch(cr, onlyUnarchived = true)
+            }
+            onLibraryUpdated("후원 작가 ${supCreators.size}명의 미보관 새 게시물 수령 작업을 대기열에 등록했습니다.")
         }
     }
 
@@ -756,7 +825,23 @@ internal fun DesktopFanboxHub(
 
             Spacer(Modifier.height(10.dp))
             HorizontalDivider(color = colors.border)
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(8.dp))
+
+            // #1 One-Click Incremental Sync across all supported creators
+            Button(
+                onClick = ::syncAllSupportingNewPosts,
+                enabled = fanboxLoggedIn || patreonLoggedIn,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(10.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = colors.emerald),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 9.dp),
+            ) {
+                Icon(Icons.Rounded.AutoAwesome, null, Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("미보관 새 보상 일괄 수령", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+
+            Spacer(Modifier.height(6.dp))
 
             // Toggles: R-18 & Hide Text Posts
             SidebarToggleRow(
@@ -808,15 +893,54 @@ internal fun DesktopFanboxHub(
 
         // Main Panel
         Column(Modifier.weight(1f).fillMaxHeight()) {
-            if (savingProgress.isNotEmpty()) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().background(colors.surface).padding(horizontal = 20.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = colors.accent)
-                    Text(savingProgress, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, color = colors.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    TextButton(onClick = { savingJob?.cancel() }) { Text("중단", color = MaterialTheme.colorScheme.error) }
+            if (savingProgress.isNotEmpty() || downloadQueue.isNotEmpty()) {
+                Column(Modifier.fillMaxWidth().background(colors.surface)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = colors.accent)
+                        Text(
+                            savingProgress.ifBlank { "대기열 준비 중… (${downloadQueue.size}건)" },
+                            Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = colors.ink,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        if (downloadQueue.isNotEmpty()) {
+                            TextButton(onClick = { showQueuePanel = !showQueuePanel }) {
+                                Text("대기열 ${downloadQueue.size}건 ${if (showQueuePanel) "▴" else "▾"}", color = colors.accent)
+                            }
+                        }
+                        TextButton(onClick = {
+                            downloadQueue.clear()
+                            savingJob?.cancel()
+                        }) { Text("전체 중단", color = MaterialTheme.colorScheme.error) }
+                    }
+                    if (showQueuePanel && downloadQueue.isNotEmpty()) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(colors.bg)
+                                .padding(horizontal = 20.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            downloadQueue.forEachIndexed { qIdx, qItem ->
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text("${qIdx + 1}. ${qItem.label}", Modifier.weight(1f), style = MaterialTheme.typography.labelSmall, color = colors.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    TextButton(
+                                        onClick = { downloadQueue.removeAll { it.id == qItem.id } },
+                                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                        modifier = Modifier.height(24.dp),
+                                    ) {
+                                        Text("제거", fontSize = 11.sp, color = colors.muted)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 HorizontalDivider(color = colors.border)
             }
@@ -829,7 +953,7 @@ internal fun DesktopFanboxHub(
                     summary = currentPost,
                     feedList = filteredFeed,
                     archivedLocalId = archivedMap[currentPost.uniqueKey],
-                    saving = savingJob?.isActive == true,
+                    saving = false, // Non-blocking queue allows adding multiple posts anytime!
                     resolvedRewardsMap = resolvedRewardsMap,
                     onSelectPost = { activePost = it },
                     onSelectCreator = { id, name, icon, svc ->
@@ -860,10 +984,11 @@ internal fun DesktopFanboxHub(
                         error = feedError,
                         hasMore = fanboxNextUrl != null || patreonNextUrl != null,
                         followBusy = followBusyId == cr.creatorId,
-                        batchSaving = savingJob?.isActive == true,
+                        batchSaving = false,
                         archivedKeys = archivedMap.keys,
                         onBack = { selectedCreator = null },
                         onToggleFollow = { toggleFollow(cr) },
+                        onSaveNewPosts = { saveCreatorPostsBatch(cr, onlyUnarchived = true) },
                         onSaveAllPosts = { saveAllCreatorPosts(cr) },
                         onOpenPlans = {
                             val url = if (cr.service == FeedService.PATREON) cr.campaignUrl.ifBlank { "https://www.patreon.com/" }
@@ -1704,6 +1829,7 @@ private fun DesktopCreatorProfilePane(
     archivedKeys: Set<String>,
     onBack: () -> Unit,
     onToggleFollow: () -> Unit,
+    onSaveNewPosts: () -> Unit,
     onSaveAllPosts: () -> Unit,
     onOpenPlans: () -> Unit,
     onEnableAdult: () -> Unit,
@@ -1742,6 +1868,16 @@ private fun DesktopCreatorProfilePane(
                     if (creator.isSupporting) FeedBadge("후원중", colors.emerald)
                 }
                 Text(if (creator.service == FeedService.PATREON) "Patreon" else "@${creator.creatorId}", style = MaterialTheme.typography.bodySmall, color = colors.muted)
+            }
+            Button(
+                onClick = onSaveNewPosts,
+                enabled = !batchSaving,
+                shape = RoundedCornerShape(10.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = colors.accent),
+            ) {
+                Icon(Icons.Rounded.AutoAwesome, null, Modifier.size(16.dp))
+                Spacer(Modifier.width(5.dp))
+                Text("새 게시물만 받기")
             }
             Button(
                 onClick = onSaveAllPosts,
@@ -2126,6 +2262,26 @@ private fun DesktopFanboxPostDetailPane(
                                     OutlinedButton(onClick = { onOpenArchived(archivedLocalId) }, shape = RoundedCornerShape(10.dp), border = BorderStroke(1.dp, colors.emerald)) {
                                         Text("내 보관함에서 열기", color = colors.emerald)
                                     }
+                                }
+                            }
+                            val detectedPasswords = remember(activeDetail.text) {
+                                PasswordExtractor.extractCandidates(activeDetail.text)
+                            }
+                            if (detectedPasswords.isNotEmpty()) {
+                                Row(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(colors.secondarySoft)
+                                        .padding(horizontal = 10.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    Text(
+                                        "본문 압축 비밀번호 자동 감지됨: ${detectedPasswords.joinToString(", ")} (암호 ZIP/7z 자동 해제 적용)",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = colors.secondary,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
                                 }
                             }
                             if (activeDetail.externalLinks.isNotEmpty()) {

@@ -34,6 +34,8 @@ internal data class FanboxCreator(
     val isSupporting: Boolean = false,
     val isFollowed: Boolean = false,
     val planFee: Int = 0,
+    val service: MobileFeedService = MobileFeedService.FANBOX,
+    val campaignUrl: String = "",
 )
 
 internal data class FanboxPlan(
@@ -88,11 +90,18 @@ internal data class FanboxPostSummary(
     val likeCount: Int,
     val type: String,
     val tags: List<String> = emptyList(),
+    val service: MobileFeedService = MobileFeedService.FANBOX,
+    val customPostUrl: String = "",
 ) {
     val year: Int? get() = publishedDatetime.take(4).toIntOrNull()
-    val postUrl: String get() = "https://${creatorId.ifBlank { "www" }}.fanbox.cc/posts/$id"
+    val postUrl: String
+        get() = customPostUrl.ifBlank {
+            if (service == MobileFeedService.PATREON) "https://www.patreon.com/posts/$id"
+            else "https://${creatorId.ifBlank { "www" }}.fanbox.cc/posts/$id"
+        }
     val displayDate: String get() = publishedDatetime.take(10)
     val isTextOnly: Boolean get() = type.equals("text", true) || (coverImageUrl.isNullOrBlank() && type != "image" && type != "file")
+    val uniqueKey: String get() = "${service.name}:$id"
 }
 
 internal data class FanboxPostDetail(
@@ -101,6 +110,7 @@ internal data class FanboxPostDetail(
     val images: List<FanboxImage>,
     val files: List<FanboxFile>,
     val tags: List<String>,
+    val externalLinks: List<MobileExternalLink> = emptyList(),
 )
 
 internal data class FanboxFeedPage(

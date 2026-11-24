@@ -76,6 +76,7 @@ import kotlinx.coroutines.launch
 
 private enum class MobileSmartFilter(val label: String) {
     ALL("전체"),
+    FAVORITES("★ 즐겨찾기"),
     TEXTLESS("Textless"),
     ATTACHMENTS("PSD·첨부"),
 }
@@ -88,7 +89,7 @@ private enum class PostDetailTab(val label: String) {
 }
 
 private enum class MainTab(val label: String) {
-    FANBOX("FANBOX"),
+    FANBOX("피드"),
     LIBRARY("내 보관함"),
     SYNC("기기 연결"),
 }
@@ -122,6 +123,7 @@ internal fun ArchiveApp(model: ArchiveModel) {
             .filter { p ->
                 val matchesSmart = when (smartFilter) {
                     MobileSmartFilter.ALL -> true
+                    MobileSmartFilter.FAVORITES -> p.isFavorite
                     MobileSmartFilter.TEXTLESS -> p.hasTextless()
                     MobileSmartFilter.ATTACHMENTS -> p.attachmentCount() > 0
                 }
@@ -646,10 +648,7 @@ private fun FilterPill(
 @Composable
 private fun AndroidPosterCard(post: LibraryPost, onClick: () -> Unit) {
     val colors = LocalAndroidGalleryColors.current
-    val cover = remember(post) {
-        post.assets.firstOrNull { it.isImage && !it.variant.equals("textless", true) }
-            ?: post.assets.firstOrNull { it.isImage }
-    }
+    val cover = remember(post) { post.coverImage() }
     val imgCount = remember(post) { post.imageCount() }
     val attachCount = remember(post) { post.attachmentCount() }
     val textless = remember(post) { post.hasTextless() }

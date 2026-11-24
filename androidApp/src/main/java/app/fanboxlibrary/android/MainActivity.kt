@@ -28,6 +28,7 @@ import app.fanboxlibrary.shared.ImportSource
 import app.fanboxlibrary.shared.LibraryAsset
 import app.fanboxlibrary.shared.LibraryPost
 import app.fanboxlibrary.shared.LibraryStore
+import app.fanboxlibrary.shared.PasswordExtractor
 import app.fanboxlibrary.shared.PostDraft
 import java.io.File
 import java.io.IOException
@@ -245,7 +246,11 @@ internal class ArchiveModel(application: Application) : AndroidViewModel(applica
                     val (fileName, url) = pair
                     savingProgress = "보관함에 저장 중 (${idx + 1}/${targets.size}) · $fileName"
                     val stream = withContext(Dispatchers.IO) {
-                        FanboxClient.downloadToInputStream(context, url)
+                        if (detail.summary.service == MobileFeedService.PATREON) {
+                            PatreonAndroidClient.downloadToInputStream(url)
+                        } else {
+                            FanboxClient.downloadToInputStream(context, url)
+                        }
                     }
                     val report = withContext(Dispatchers.IO) {
                         stream.use { input ->
@@ -267,6 +272,37 @@ internal class ArchiveModel(application: Application) : AndroidViewModel(applica
                     if (skipped > 0) append(" · 건너뜀 ${skipped}개")
                     if (firstWarning.isNotEmpty()) append("\n$firstWarning")
                 }
+            } catch (e: Exception) {
+                reportError(e)
+            } finally {
+                savingPostId = null
+                savingProgress = ""
+            }
+        }
+    }
+
+    fun saveMobileExternalRewards(detail: FanboxPostDetail, rewards: List<MobileResolvedReward>) {
+        if (busy || savingPostId != null || rewards.isEmpty()) return
+        savingPostId = detail.summary.id
+        savingProgress = "외부 보상 다운로드 준비 중…"
+        val passwords = PasswordExtractor.extractCandidates(detail.text)
+        viewModelScope.launch {
+            try {
+                val draft = PostDraft(
+                    creator = detail.summary.creatorName,
+                    title = detail.summary.title,
+                    year = detail.summary.year,
+                    sourceUrl = detail.summary.postUrl,
+                )
+                val rep = AndroidRewardTools.downloadAndImportRewards(
+                    store = store,
+                    draft = draft,
+                    rewards = rewards,
+                    passwordCandidates = passwords,
+                    onProgress = { msg -> savingProgress = msg },
+                )
+                posts = withContext(Dispatchers.IO) { store.posts() }
+                notice = "외부 보상 저장 완료 · 추가 ${rep.added}개 · 기존 ${rep.reused}개"
             } catch (e: Exception) {
                 reportError(e)
             } finally {

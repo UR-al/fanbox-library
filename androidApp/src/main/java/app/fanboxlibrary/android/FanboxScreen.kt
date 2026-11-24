@@ -96,10 +96,19 @@ private enum class FeedCategory(val label: String) {
     SEARCH("작가 찾기"),
 }
 
+private enum class MobileServiceFilter(val label: String) {
+    ALL("전체"),
+    FANBOX("FANBOX"),
+    PATREON("Patreon"),
+}
+
 private data class WebModalRequest(
     val url: String,
     val title: String,
     val autoCloseOnLogin: Boolean = false,
+    val autoCloseOnPatreonLogin: Boolean = false,
+    val gateHostToUnlock: String? = null,
+    val onGateRewardsUnlocked: ((List<MobileResolvedReward>) -> Unit)? = null,
 )
 
 @Composable
@@ -122,7 +131,9 @@ internal fun FanboxHubScreen(
     var showAdult by rememberSaveable { mutableStateOf(prefs.getBoolean("show_adult", false)) }
     var hideTextPosts by rememberSaveable { mutableStateOf(prefs.getBoolean("hide_text_posts", false)) }
     var gridMode by rememberSaveable { mutableStateOf(prefs.getBoolean("feed_grid_mode", false)) }
+    var serviceFilter by remember { mutableStateOf(MobileServiceFilter.ALL) }
     var loggedIn by remember { mutableStateOf(FanboxSession.hasLoginCookie()) }
+    var patreonLoggedIn by remember { mutableStateOf(PatreonAndroidSession.hasLoginCookie()) }
 
     // Explicit WebView modal (ONLY opened when user taps Login, Subscribe/Plan, or explicit Web button)
     var webModal by remember { mutableStateOf<WebModalRequest?>(null) }
@@ -130,6 +141,7 @@ internal fun FanboxHubScreen(
     // Feed state
     var feedItems by remember { mutableStateOf<List<FanboxPostSummary>>(emptyList()) }
     var feedNextUrl by remember { mutableStateOf<String?>(null) }
+    var patreonNextUrl by remember { mutableStateOf<String?>(null) }
     var feedLoading by remember { mutableStateOf(false) }
     var feedError by remember { mutableStateOf<FanboxResult<Nothing>?>(null) }
 
@@ -156,7 +168,8 @@ internal fun FanboxHubScreen(
     val archivedPostIdMap = remember(model.posts) {
         buildMap {
             model.posts.forEach { p ->
-                FanboxLinks.postId(p.sourceUrl)?.let { fid -> put(fid, p.id) }
+                FanboxLinks.postId(p.sourceUrl)?.let { fid -> put("FANBOX:$fid", p.id); put(fid, p.id) }
+                FanboxLinks.patreonPostId(p.sourceUrl)?.let { pid -> put("PATREON:$pid", p.id); put(pid, p.id) }
             }
         }
     }
@@ -167,30 +180,66 @@ internal fun FanboxHubScreen(
 
     fun loadFeed(reset: Boolean = true) {
         if (feedLoading) return
-        val next = if (reset) null else feedNextUrl
-        if (!reset && next == null) return
+        val nextFb = if (reset) null else feedNextUrl
+        val nextPt = if (reset) null else patreonNextUrl
+        if (!reset && nextFb == null && nextPt == null) return
         feedLoading = true
         if (reset) feedError = null
         scope.launch {
             loggedIn = FanboxSession.hasLoginCookie()
+            patreonLoggedIn = PatreonAndroidSession.hasLoginCookie()
             val creator = selectedCreator
-            val result = when {
-                creator != null -> FanboxClient.fetchCreatorPosts(context, creator.creatorId, next)
-                category == FeedCategory.SUPPORTING -> FanboxClient.fetchSupportingFeed(context, next)
-                else -> FanboxClient.fetchHomeFeed(context, next)
+            val collected = mutableListOf<FanboxPostSummary>()
+            var lastErr: FanboxResult<Nothing>? = null
+            var newFbNext: String? = null
+            var newPtNext: String? = null
+
+            if (creator != null) {
+                val res = if (creator.service == MobileFeedService.PATREON) {
+                    PatreonAndroidClient.fetchCampaignPosts(creator.creatorId, nextPt)
+                } else {
+                    FanboxClient.fetchCreatorPosts(context, creator.creatorId, nextFb)
+                }
+                when (res) {
+                    is FanboxResult.Success -> {
+                        collected.addAll(res.data.items)
+                        if (creator.service == MobileFeedService.PATREON) newPtNext = res.data.nextUrl else newFbNext = res.data.nextUrl
+                    }
+                    is FanboxResult.AuthRequired -> lastErr = res
+                    is FanboxResult.CloudflareBlocked -> lastErr = res
+                    is FanboxResult.Error -> lastErr = res
+                }
+            } else {
+                val wantFb = serviceFilter != MobileServiceFilter.PATREON && loggedIn && (reset || nextFb != null)
+                val wantPt = serviceFilter != MobileServiceFilter.FANBOX && patreonLoggedIn && (reset || nextPt != null)
+                if (wantFb) {
+                    val res = if (category == FeedCategory.SUPPORTING) FanboxClient.fetchSupportingFeed(context, nextFb)
+                    else FanboxClient.fetchHomeFeed(context, nextFb)
+                    when (res) {
+                        is FanboxResult.Success -> { collected.addAll(res.data.items); newFbNext = res.data.nextUrl }
+                        is FanboxResult.AuthRequired -> lastErr = res
+                        is FanboxResult.CloudflareBlocked -> lastErr = res
+                        is FanboxResult.Error -> lastErr = res
+                    }
+                }
+                if (wantPt) {
+                    when (val res = PatreonAndroidClient.fetchStream(nextPt)) {
+                        is FanboxResult.Success -> { collected.addAll(res.data.items); newPtNext = res.data.nextUrl }
+                        is FanboxResult.AuthRequired -> if (collected.isEmpty()) lastErr = res
+                        is FanboxResult.CloudflareBlocked -> if (collected.isEmpty()) lastErr = res
+                        is FanboxResult.Error -> if (collected.isEmpty()) lastErr = res
+                    }
+                }
             }
-            when (result) {
-                is FanboxResult.Success -> {
-                    feedItems = if (reset) result.data.items else (feedItems + result.data.items).distinctBy { it.id }
-                    feedNextUrl = result.data.nextUrl
-                    feedError = null
-                }
-                is FanboxResult.AuthRequired -> {
-                    loggedIn = FanboxSession.hasLoginCookie()
-                    feedError = result
-                }
-                is FanboxResult.CloudflareBlocked -> feedError = result
-                is FanboxResult.Error -> feedError = result
+
+            if (collected.isNotEmpty() || lastErr == null) {
+                val merged = if (reset) collected else (feedItems + collected)
+                feedItems = merged.distinctBy { it.uniqueKey }.sortedByDescending { it.publishedDatetime }
+                feedNextUrl = newFbNext
+                patreonNextUrl = newPtNext
+                feedError = null
+            } else {
+                feedError = lastErr
             }
             feedLoading = false
         }
@@ -202,18 +251,30 @@ internal fun FanboxHubScreen(
         creatorsError = null
         scope.launch {
             loggedIn = FanboxSession.hasLoginCookie()
-            val result = FanboxClient.fetchCreators(context)
-            when (result) {
-                is FanboxResult.Success -> {
-                    creators = result.data
-                    creatorsError = null
+            patreonLoggedIn = PatreonAndroidSession.hasLoginCookie()
+            val combined = mutableListOf<FanboxCreator>()
+            var lastErr: FanboxResult<Nothing>? = null
+            if (serviceFilter != MobileServiceFilter.PATREON && loggedIn) {
+                when (val r = FanboxClient.fetchCreators(context)) {
+                    is FanboxResult.Success -> combined.addAll(r.data)
+                    is FanboxResult.AuthRequired -> lastErr = r
+                    is FanboxResult.CloudflareBlocked -> lastErr = r
+                    is FanboxResult.Error -> lastErr = r
                 }
-                is FanboxResult.AuthRequired -> {
-                    loggedIn = FanboxSession.hasLoginCookie()
-                    creatorsError = result
+            }
+            if (serviceFilter != MobileServiceFilter.FANBOX && patreonLoggedIn) {
+                when (val r = PatreonAndroidClient.fetchSupportingCreators()) {
+                    is FanboxResult.Success -> combined.addAll(r.data)
+                    is FanboxResult.AuthRequired -> if (combined.isEmpty()) lastErr = r
+                    is FanboxResult.CloudflareBlocked -> if (combined.isEmpty()) lastErr = r
+                    is FanboxResult.Error -> if (combined.isEmpty()) lastErr = r
                 }
-                is FanboxResult.CloudflareBlocked -> creatorsError = result
-                is FanboxResult.Error -> creatorsError = result
+            }
+            if (combined.isNotEmpty() || lastErr == null) {
+                creators = combined.distinctBy { "${it.service.name}:${it.creatorId}" }
+                creatorsError = null
+            } else {
+                creatorsError = lastErr
             }
             creatorsLoading = false
         }
@@ -226,15 +287,29 @@ internal fun FanboxHubScreen(
         searchError = null
         hasSearched = true
         scope.launch {
-            val result = FanboxClient.searchCreators(context, q)
-            when (result) {
-                is FanboxResult.Success -> {
-                    searchResults = result.data
-                    searchError = null
+            val found = mutableListOf<FanboxCreator>()
+            var err: FanboxResult<Nothing>? = null
+            if (serviceFilter != MobileServiceFilter.PATREON) {
+                when (val r = FanboxClient.searchCreators(context, q)) {
+                    is FanboxResult.Success -> found.addAll(r.data)
+                    is FanboxResult.AuthRequired -> err = r
+                    is FanboxResult.CloudflareBlocked -> err = r
+                    is FanboxResult.Error -> err = r
                 }
-                is FanboxResult.AuthRequired -> searchError = result
-                is FanboxResult.CloudflareBlocked -> searchError = result
-                is FanboxResult.Error -> searchError = result
+            }
+            if (serviceFilter != MobileServiceFilter.FANBOX) {
+                when (val r = PatreonAndroidClient.searchCreators(q)) {
+                    is FanboxResult.Success -> found.addAll(r.data)
+                    is FanboxResult.AuthRequired -> if (found.isEmpty()) err = r
+                    is FanboxResult.CloudflareBlocked -> if (found.isEmpty()) err = r
+                    is FanboxResult.Error -> if (found.isEmpty()) err = r
+                }
+            }
+            if (found.isNotEmpty() || err == null) {
+                searchResults = found.distinctBy { "${it.service.name}:${it.creatorId}" }
+                searchError = null
+            } else {
+                searchError = err
             }
             searchLoading = false
         }
@@ -273,29 +348,33 @@ internal fun FanboxHubScreen(
     }
 
     // Load full creator profile + plans whenever a creator is selected
-    LaunchedEffect(selectedCreator?.creatorId) {
+    LaunchedEffect(selectedCreator?.creatorId, selectedCreator?.service) {
         val cr = selectedCreator ?: return@LaunchedEffect
         creatorPlans = emptyList()
-        val profileRes = FanboxClient.fetchCreatorProfile(context, cr.creatorId)
-        if (profileRes is FanboxResult.Success) {
-            selectedCreator = profileRes.data.copy(
-                isSupporting = profileRes.data.isSupporting || cr.isSupporting,
-                planFee = cr.planFee,
-            )
-        }
-        val plansRes = FanboxClient.fetchCreatorPlans(context, cr.creatorId)
-        if (plansRes is FanboxResult.Success) {
-            creatorPlans = plansRes.data
+        if (cr.service == MobileFeedService.FANBOX) {
+            val profileRes = FanboxClient.fetchCreatorProfile(context, cr.creatorId)
+            if (profileRes is FanboxResult.Success) {
+                selectedCreator = profileRes.data.copy(
+                    isSupporting = profileRes.data.isSupporting || cr.isSupporting,
+                    planFee = cr.planFee,
+                )
+            }
+            val plansRes = FanboxClient.fetchCreatorPlans(context, cr.creatorId)
+            if (plansRes is FanboxResult.Success) {
+                creatorPlans = plansRes.data
+            }
         }
     }
 
-    LaunchedEffect(category, selectedCreator?.creatorId, loggedIn) {
+    LaunchedEffect(category, serviceFilter, selectedCreator?.creatorId, loggedIn, patreonLoggedIn) {
         loggedIn = FanboxSession.hasLoginCookie()
+        patreonLoggedIn = PatreonAndroidSession.hasLoginCookie()
+        val anyAuth = loggedIn || patreonLoggedIn
         when {
             selectedCreator != null -> loadFeed(reset = true)
-            category == FeedCategory.CREATORS -> if (loggedIn && creators.isEmpty()) loadCreators()
+            category == FeedCategory.CREATORS -> if (anyAuth) loadCreators()
             category == FeedCategory.SEARCH -> Unit
-            else -> if (loggedIn) loadFeed(reset = true)
+            else -> if (anyAuth) loadFeed(reset = true)
         }
     }
 
@@ -328,11 +407,12 @@ internal fun FanboxHubScreen(
                 model = model,
                 onClose = { didLogin ->
                     webModal = null
+                    loggedIn = FanboxSession.hasLoginCookie()
+                    patreonLoggedIn = PatreonAndroidSession.hasLoginCookie()
                     if (didLogin) {
-                        loggedIn = FanboxSession.hasLoginCookie()
                         FanboxWebBridge.reloadOrigin()
                         scope.launch {
-                            delay(600)
+                            delay(500)
                             if (selectedCreator != null) loadFeed(reset = true)
                             else if (category == FeedCategory.CREATORS) loadCreators()
                             else if (category != FeedCategory.SEARCH) loadFeed(reset = true)
@@ -347,21 +427,37 @@ internal fun FanboxHubScreen(
         val currentPostId = activePostId
         if (currentPostId != null) {
             BackHandler { activePostId = null }
-            val visibleFeed = remember(feedItems, showAdult) {
-                if (showAdult) feedItems else feedItems.filterNot { it.hasAdultContent }
+            val visibleFeed = remember(feedItems, showAdult, serviceFilter, selectedCreator) {
+                feedItems.filter { p ->
+                    val okAdult = showAdult || !p.hasAdultContent
+                    val okSvc = selectedCreator != null || serviceFilter == MobileServiceFilter.ALL ||
+                        (serviceFilter == MobileServiceFilter.FANBOX && p.service == MobileFeedService.FANBOX) ||
+                        (serviceFilter == MobileServiceFilter.PATREON && p.service == MobileFeedService.PATREON)
+                    okAdult && okSvc
+                }
             }
+            val activeSummary = remember(feedItems, currentPostId) { feedItems.firstOrNull { it.id == currentPostId } }
             FanboxPostDetailScreen(
                 postId = currentPostId,
+                serviceHint = activeSummary?.service ?: MobileFeedService.FANBOX,
                 feedList = visibleFeed,
                 model = model,
-                archivedLocalId = archivedPostIdMap[currentPostId],
+                archivedLocalId = archivedPostIdMap[activeSummary?.uniqueKey ?: currentPostId],
                 onSelectPost = { activePostId = it },
-                onSelectCreator = { id, name, icon ->
+                onSelectCreator = { id, name, icon, svc ->
                     activePostId = null
-                    selectedCreator = FanboxCreator(id, "", name, icon, null, "")
+                    selectedCreator = FanboxCreator(id, "", name, icon, null, "", service = svc)
                 },
                 onOpenInWeb = { url ->
-                    webModal = WebModalRequest(url = url, title = "FANBOX 원문")
+                    webModal = WebModalRequest(url = url, title = "원문 보기")
+                },
+                onRequestGateWebUnlock = { startUrl, gateHost, onUnlocked ->
+                    webModal = WebModalRequest(
+                        url = startUrl,
+                        title = "Patreon 보상 잠금 해제",
+                        gateHostToUnlock = gateHost,
+                        onGateRewardsUnlocked = onUnlocked,
+                    )
                 },
                 onOpenArchived = onOpenArchivedPost,
                 onOpenLightbox = { imgs, start ->
@@ -393,8 +489,8 @@ internal fun FanboxHubScreen(
                     Text("F", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 15.sp)
                 }
                 Text(
-                    "FANBOX",
-                    style = MaterialTheme.typography.titleLarge,
+                    "FANBOX · Patreon",
+                    style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     color = colors.ink,
                 )
@@ -501,6 +597,59 @@ internal fun FanboxHubScreen(
                         contentDescription = "테마 전환",
                         tint = colors.muted,
                         modifier = Modifier.size(17.dp),
+                    )
+                }
+            }
+
+            // Mobile Service Filter + Patreon Quick Login Bar
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 14.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                MobileServiceFilter.entries.forEach { sf ->
+                    val sel = serviceFilter == sf
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (sel) colors.accent else colors.surface)
+                            .border(1.dp, if (sel) colors.accent else colors.border, RoundedCornerShape(8.dp))
+                            .clickable { serviceFilter = sf }
+                            .padding(horizontal = 10.dp, vertical = 5.dp),
+                    ) {
+                        Text(sf.label, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = if (sel) Color.White else colors.muted)
+                    }
+                }
+                if (!loggedIn) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(colors.accentSoft)
+                            .clickable {
+                                webModal = WebModalRequest("https://www.fanbox.cc/login", "FANBOX 로그인", autoCloseOnLogin = true)
+                            }
+                            .padding(horizontal = 9.dp, vertical = 5.dp),
+                    ) {
+                        Text("FANBOX 로그인", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = colors.accent)
+                    }
+                }
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (patreonLoggedIn) colors.emeraldSoft else Color(0x33FF6B3D))
+                        .clickable {
+                            webModal = WebModalRequest("https://www.patreon.com/login", "Patreon 로그인", autoCloseOnPatreonLogin = true)
+                        }
+                        .padding(horizontal = 9.dp, vertical = 5.dp),
+                ) {
+                    Text(
+                        if (patreonLoggedIn) "Patreon 연결됨 ✓" else "Patreon 로그인",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (patreonLoggedIn) colors.emerald else Color(0xFFFF6B3D),
                     )
                 }
             }
@@ -1429,22 +1578,26 @@ private fun FeedErrorState(
 @Composable
 private fun FanboxPostDetailScreen(
     postId: String,
+    serviceHint: MobileFeedService,
     feedList: List<FanboxPostSummary>,
     model: ArchiveModel,
     archivedLocalId: String?,
     onSelectPost: (String) -> Unit,
-    onSelectCreator: (creatorId: String, name: String, iconUrl: String?) -> Unit,
+    onSelectCreator: (creatorId: String, name: String, iconUrl: String?, svc: MobileFeedService) -> Unit,
     onOpenInWeb: (String) -> Unit,
+    onRequestGateWebUnlock: (startUrl: String, gateHost: String, onUnlocked: (List<MobileResolvedReward>) -> Unit) -> Unit,
     onOpenArchived: (String) -> Unit,
     onOpenLightbox: (List<FanboxImage>, Int) -> Unit,
     onBack: () -> Unit,
 ) {
     val colors = LocalAndroidGalleryColors.current
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val density = LocalDensity.current
     val swipeThresholdPx = with(density) { 80.dp.toPx() }
 
     val idx = remember(feedList, postId) { feedList.indexOfFirst { it.id == postId } }
+    val activeService = feedList.getOrNull(idx)?.service ?: serviceHint
     val prevPost = if (idx > 0) feedList[idx - 1] else null
     val nextPost = if (idx in 0 until feedList.lastIndex) feedList[idx + 1] else null
 
@@ -1452,11 +1605,17 @@ private fun FanboxPostDetailScreen(
     var detail by remember(postId) { mutableStateOf<FanboxPostDetail?>(null) }
     var error by remember(postId) { mutableStateOf<FanboxResult<Nothing>?>(null) }
     var reloadKey by remember(postId) { mutableIntStateOf(0) }
+    var unlockedMultiRewards by remember(postId) { mutableStateOf<List<MobileResolvedReward>>(emptyList()) }
 
-    LaunchedEffect(postId, reloadKey) {
+    LaunchedEffect(postId, reloadKey, activeService) {
         loading = true
         error = null
-        when (val res = FanboxClient.fetchPostDetail(context, postId)) {
+        val res = if (activeService == MobileFeedService.PATREON) {
+            PatreonAndroidClient.fetchPostDetail(postId)
+        } else {
+            FanboxClient.fetchPostDetail(context, postId)
+        }
+        when (res) {
             is FanboxResult.Success -> detail = res.data
             is FanboxResult.AuthRequired -> error = res
             is FanboxResult.CloudflareBlocked -> error = res
@@ -1537,7 +1696,7 @@ private fun FanboxPostDetailScreen(
                                 Row(
                                     modifier = Modifier
                                         .clip(RoundedCornerShape(10.dp))
-                                        .clickable { onSelectCreator(s.creatorId, s.creatorName, s.creatorIconUrl) }
+                                        .clickable { onSelectCreator(s.creatorId, s.creatorName, s.creatorIconUrl, s.service) }
                                         .padding(vertical = 2.dp),
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1605,9 +1764,62 @@ private fun FanboxPostDetailScreen(
                                         Text("후원자 한정 게시글입니다.", style = MaterialTheme.typography.titleSmall, color = colors.ink)
                                         Text("작가 페이지에서 후원 플랜을 확인하고 구독할 수 있습니다.", style = MaterialTheme.typography.bodySmall, color = colors.muted)
                                         OutlinedButton(
-                                            onClick = { onSelectCreator(s.creatorId, s.creatorName, s.creatorIconUrl) },
+                                            onClick = { onSelectCreator(s.creatorId, s.creatorName, s.creatorIconUrl, s.service) },
                                             shape = RoundedCornerShape(10.dp),
                                         ) { Text("작가 플랜 보기") }
+                                    }
+                                }
+
+                                if (d.externalLinks.isNotEmpty()) {
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(colors.surface)
+                                            .border(1.dp, colors.emerald.copy(alpha = 0.5f), RoundedCornerShape(12.dp))
+                                            .padding(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                                    ) {
+                                        Text("외부 보상 원클릭 인증 · 저장", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = colors.emerald)
+                                        d.externalLinks.forEach { extLink ->
+                                            Button(
+                                                onClick = {
+                                                    scope.launch {
+                                                        when (val chk = AndroidRewardTools.checkExternalLink(extLink)) {
+                                                            is MobileGateCheckResult.Ready -> {
+                                                                if (chk.rewards.size == 1) model.saveMobileExternalRewards(d, chk.rewards)
+                                                                else unlockedMultiRewards = chk.rewards
+                                                            }
+                                                            is MobileGateCheckResult.NeedsWebUnlock -> {
+                                                                onRequestGateWebUnlock(chk.startUrl, chk.gateHost) { unlocked ->
+                                                                    if (unlocked.size == 1) model.saveMobileExternalRewards(d, unlocked)
+                                                                    else unlockedMultiRewards = unlocked
+                                                                }
+                                                            }
+                                                            is MobileGateCheckResult.Failed -> model.notice = chk.message
+                                                        }
+                                                    }
+                                                },
+                                                enabled = model.savingPostId == null && !model.busy,
+                                                modifier = Modifier.fillMaxWidth(),
+                                                shape = RoundedCornerShape(10.dp),
+                                                colors = ButtonDefaults.buttonColors(containerColor = colors.emerald),
+                                            ) {
+                                                Icon(Icons.Rounded.Download, null, Modifier.size(16.dp))
+                                                Spacer(Modifier.width(6.dp))
+                                                Text("${extLink.kind.badge} · ${extLink.label}", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            }
+                                        }
+                                        unlockedMultiRewards.forEach { rw ->
+                                            OutlinedButton(
+                                                onClick = { model.saveMobileExternalRewards(d, listOf(rw)) },
+                                                enabled = model.savingPostId == null,
+                                                modifier = Modifier.fillMaxWidth(),
+                                                shape = RoundedCornerShape(9.dp),
+                                            ) {
+                                                Text("저장: ${rw.label}", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            }
+                                        }
                                     }
                                 }
 
@@ -1843,11 +2055,32 @@ private fun FanboxWebModalScreen(
                             if (!url.isNullOrBlank()) currentUrl = url
                             FanboxSession.flushCookies()
                             val logged = FanboxSession.hasLoginCookie()
-                            nowLoggedIn = logged
+                            val ptLogged = PatreonAndroidSession.hasLoginCookie()
+                            nowLoggedIn = logged || ptLogged
                             if (request.autoCloseOnLogin && !initiallyLoggedIn && logged &&
                                 url != null && url.contains("fanbox.cc") && !url.contains("/login")
                             ) {
                                 onClose(true)
+                                return
+                            }
+                            if (request.autoCloseOnPatreonLogin && ptLogged &&
+                                url != null && url.contains("patreon.com") && !url.contains("/login")
+                            ) {
+                                onClose(true)
+                                return
+                            }
+                            val gateHost = request.gateHostToUnlock
+                            if (!gateHost.isNullOrBlank() && url != null && url.contains(gateHost, ignoreCase = true) &&
+                                !url.contains("/patreon-flow") && !url.contains("/patreon-authorization")
+                            ) {
+                                view?.evaluateJavascript("(function(){return document.documentElement ? document.documentElement.outerHTML : '';})()") { jsVal ->
+                                    val decodedHtml = runCatching { org.json.JSONTokener(jsVal).nextValue() as? String }.getOrNull().orEmpty()
+                                    val (rewards, _) = AndroidRewardTools.parseGateHtml(url, decodedHtml)
+                                    if (rewards.isNotEmpty()) {
+                                        request.onGateRewardsUnlocked?.invoke(rewards)
+                                        onClose(false)
+                                    }
+                                }
                             }
                         }
                     }

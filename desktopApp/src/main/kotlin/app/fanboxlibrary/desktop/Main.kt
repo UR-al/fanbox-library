@@ -15,6 +15,7 @@ import androidx.compose.material.icons.rounded.Devices
 import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.LightMode
 import androidx.compose.material.icons.rounded.SystemUpdateAlt
+import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -22,10 +23,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.*
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Window
+import androidx.compose.ui.window.WindowPlacement
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
 import app.fanboxlibrary.shared.*
@@ -56,22 +60,86 @@ private val prefs: Preferences = Preferences.userRoot().node("app/fanboxlibrary/
 fun main() = application {
     runCatching { UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName()) }
     var darkTheme by remember { mutableStateOf(prefs.getBoolean("darkTheme", true)) }
+    var bossMode by remember { mutableStateOf(false) }
+    val winState = rememberWindowState(width = 1280.dp, height = 840.dp)
+    val isFullscreen = winState.placement == WindowPlacement.Fullscreen
+
+    fun toggleFullscreen() {
+        winState.placement = if (winState.placement == WindowPlacement.Fullscreen) {
+            WindowPlacement.Floating
+        } else {
+            WindowPlacement.Fullscreen
+        }
+    }
+
     Window(
         onCloseRequest = ::exitApplication,
-        title = "FANBOX 보관함",
-        state = rememberWindowState(width = 1280.dp, height = 840.dp),
+        title = if (bossMode) "제목 없음 - 메모" else "FANBOX 보관함",
+        state = winState,
+        onPreviewKeyEvent = { ev ->
+            if (ev.type == KeyEventType.KeyDown) {
+                when {
+                    ev.key == Key.F9 || (ev.isAltPressed && ev.key == Key.H) -> {
+                        bossMode = !bossMode
+                        true
+                    }
+                    ev.key == Key.F11 -> {
+                        toggleFullscreen()
+                        true
+                    }
+                    else -> false
+                }
+            } else false
+        },
     ) {
         LaunchedEffect(window) { window.minimumSize = Dimension(820, 600) }
         FanboxLibraryTheme(darkTheme = darkTheme) {
-            LibraryApp(
-                owner = window,
-                darkTheme = darkTheme,
-                onToggleTheme = {
-                    darkTheme = !darkTheme
-                    prefs.putBoolean("darkTheme", darkTheme)
-                },
-            )
+            if (bossMode) {
+                BossDisguiseScreen(onRestore = { bossMode = false })
+            } else {
+                LibraryApp(
+                    owner = window,
+                    darkTheme = darkTheme,
+                    isFullscreen = isFullscreen,
+                    onToggleFullscreen = ::toggleFullscreen,
+                    onActivateBossMode = { bossMode = true },
+                    onToggleTheme = {
+                        darkTheme = !darkTheme
+                        prefs.putBoolean("darkTheme", darkTheme)
+                    },
+                )
+            }
         }
+    }
+}
+
+@Composable
+private fun BossDisguiseScreen(onRestore: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF1E1E1E))
+            .padding(24.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("파일(F)   편집(E)   보기(V)", fontSize = 12.sp, color = Color(0xFF9CA3AF))
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = onRestore) {
+                Text("보관함 복귀 (F9 / Alt+H)", fontSize = 11.sp, color = Color(0xFF6B7280))
+            }
+        }
+        HorizontalDivider(color = Color(0xFF333333))
+        Spacer(Modifier.height(16.dp))
+        Text(
+            "- 프로젝트 일정 정리\n- 주간 체크리스트 점검\n- 백업 상태 확인 완료",
+            fontFamily = FontFamily.Monospace,
+            fontSize = 14.sp,
+            lineHeight = 22.sp,
+            color = Color(0xFFD1D5DB),
+        )
     }
 }
 
@@ -106,6 +174,9 @@ internal fun LibraryApp(
     owner: AwtWindow?,
     root: File = libraryDirectory(),
     darkTheme: Boolean = true,
+    isFullscreen: Boolean = false,
+    onToggleFullscreen: () -> Unit = {},
+    onActivateBossMode: () -> Unit = {},
     onToggleTheme: () -> Unit = {},
 ) {
     val colors = LocalGalleryColors.current
@@ -273,7 +344,8 @@ internal fun LibraryApp(
 
     Box(Modifier.fillMaxSize().background(colors.bg)) {
         Column(Modifier.fillMaxSize()) {
-            // Top App Bar
+            // Top App Bar (hidden in immersive fullscreen reader)
+            if (!(isFullscreen && currentPost != null && activeSection == DesktopSection.LIBRARY)) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -392,6 +464,25 @@ internal fun LibraryApp(
                     )
                 }
 
+                // Boss Key Quick Hide Button
+                if (owner != null) {
+                    IconButton(
+                        onClick = onActivateBossMode,
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(colors.surface)
+                            .border(1.dp, colors.border, RoundedCornerShape(10.dp)),
+                    ) {
+                        Icon(
+                            Icons.Rounded.VisibilityOff,
+                            contentDescription = "긴급 화면 숨김 (F9 / Alt+H)",
+                            tint = colors.muted,
+                            modifier = Modifier.size(18.dp),
+                        )
+                    }
+                }
+
                 // Theme Toggle
                 IconButton(
                     onClick = onToggleTheme,
@@ -454,6 +545,7 @@ internal fun LibraryApp(
             }
 
             HorizontalDivider(color = colors.border)
+            }
 
             if (busy.isNotEmpty()) {
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = colors.accent)
@@ -528,6 +620,47 @@ internal fun LibraryApp(
                             it.mergePosts(targetId, sourceIds, newTitle = seriesTitle)
                         }
                     },
+                    onToggleFavorite = { postId ->
+                        val loaded = store ?: return@Shelf
+                        scope.launch {
+                            val latest = withContext(Dispatchers.IO) {
+                                loaded.toggleFavoritePost(postId)
+                                loaded.posts()
+                            }
+                            posts = latest
+                        }
+                    },
+                    onDeletePost = { targetPost ->
+                        val loaded = store ?: return@Shelf
+                        scope.launch {
+                            val (deleted, latest) = withContext(Dispatchers.IO) {
+                                loaded.deletePost(targetPost.id) to loaded.posts()
+                            }
+                            posts = latest
+                            if (selected == targetPost.id) selected = null
+                            if (deleted) notice = Notice("‘${targetPost.titleLabel()}’ 작품을 삭제했습니다.")
+                        }
+                    },
+                    onExportBackup = { targetPosts ->
+                        val destList = chooseFiles(owner, directory = true)
+                        val destRoot = destList.firstOrNull() ?: return@Shelf
+                        if (busy.isNotEmpty()) return@Shelf
+                        busy = "깔끔한 폴더 구조로 백업 준비 중…"
+                        scope.launch {
+                            try {
+                                val fileCount = withContext(Dispatchers.IO) {
+                                    LibraryExporter.exportPostsToCleanFolderTree(targetPosts, destRoot) { cur, tot, title ->
+                                        busy = "폴더 백업 내보내는 중 ($cur/$tot) · $title"
+                                    }
+                                }
+                                notice = Notice("폴더 백업 완료 · ${targetPosts.size}작품 (총 ${fileCount}개 파일) → ${destRoot.absolutePath}")
+                            } catch (e: Exception) {
+                                notice = Notice("백업 내보내기 실패: " + (e.localizedMessage ?: e.javaClass.simpleName))
+                            } finally {
+                                busy = ""
+                            }
+                        }
+                    },
                 )
 
                 else -> key(currentPost.id) {
@@ -580,6 +713,97 @@ internal fun LibraryApp(
                                 } catch (e: Exception) {
                                     notice = Notice("삭제 실패: " + (e.localizedMessage ?: e.javaClass.simpleName))
                                 }
+                            }
+                        },
+                        isFullscreen = isFullscreen,
+                        onToggleFullscreen = onToggleFullscreen,
+                        onSaveLastPage = { pageIdx ->
+                            val loaded = store ?: return@PostReader
+                            scope.launch(Dispatchers.IO) {
+                                loaded.saveLastReadPage(currentPost.id, pageIdx)
+                            }
+                        },
+                        onToggleFavoritePost = {
+                            val loaded = store ?: return@PostReader
+                            scope.launch {
+                                val (fav, latest) = withContext(Dispatchers.IO) {
+                                    loaded.toggleFavoritePost(currentPost.id) to loaded.posts()
+                                }
+                                posts = latest
+                                notice = Notice(if (fav) "★ 즐겨찾기에 추가했습니다." else "즐겨찾기에서 해제했습니다.")
+                            }
+                        },
+                        onToggleBookmarkAsset = { asset ->
+                            val loaded = store ?: return@PostReader
+                            scope.launch {
+                                val (marked, latest) = withContext(Dispatchers.IO) {
+                                    loaded.toggleBookmarkAsset(currentPost.id, asset.id) to loaded.posts()
+                                }
+                                posts = latest
+                                notice = Notice(if (marked) "♥ 현재 페이지를 북마크했습니다." else "페이지 북마크를 해제했습니다.")
+                            }
+                        },
+                        onSetCoverAsset = { asset ->
+                            val loaded = store ?: return@PostReader
+                            scope.launch {
+                                val latest = withContext(Dispatchers.IO) {
+                                    loaded.setCoverAsset(currentPost.id, asset.id)
+                                    loaded.posts()
+                                }
+                                posts = latest
+                                notice = Notice("‘${asset.name}’ 페이지를 대표 표지로 지정했습니다.")
+                            }
+                        },
+                        onMoveAsset = { asset, delta ->
+                            val loaded = store ?: return@PostReader
+                            scope.launch {
+                                val latest = withContext(Dispatchers.IO) {
+                                    loaded.moveAsset(currentPost.id, asset.id, delta)
+                                    loaded.posts()
+                                }
+                                posts = latest
+                            }
+                        },
+                        onSortAssetsNaturally = {
+                            val loaded = store ?: return@PostReader
+                            scope.launch {
+                                val latest = withContext(Dispatchers.IO) {
+                                    loaded.sortPostAssetsNaturally(currentPost.id)
+                                    loaded.posts()
+                                }
+                                posts = latest
+                                notice = Notice("파일명 순서(1, 2, …, 10)대로 페이지를 정렬했습니다.")
+                            }
+                        },
+                        onDeleteWholePost = {
+                            val loaded = store ?: return@PostReader
+                            scope.launch {
+                                val (_, latest) = withContext(Dispatchers.IO) {
+                                    loaded.deletePost(currentPost.id) to loaded.posts()
+                                }
+                                posts = latest
+                                selected = null
+                                notice = Notice("‘${currentPost.titleLabel()}’ 작품을 삭제했습니다.")
+                            }
+                        },
+                        onExportCbz = {
+                            val safeDefault = "${currentPost.artistLabel()} - ${currentPost.titleLabel()}.cbz"
+                                .replace(Regex("""[\\/:*?"<>|]+"""), "_")
+                            val picker = JFileChooser().apply {
+                                dialogTitle = ".cbz 만화책 파일로 저장"
+                                selectedFile = File(safeDefault)
+                            }
+                            if (picker.showSaveDialog(owner) == JFileChooser.APPROVE_OPTION) {
+                                val dest = picker.selectedFile
+                                launchExternal("CBZ 만화책 내보내기 완료: ${dest.name}") {
+                                    LibraryExporter.exportPostToCbz(currentPost, dest)
+                                }
+                            }
+                        },
+                        onExportFolder = {
+                            val destRoot = chooseFiles(owner, directory = true).firstOrNull() ?: return@PostReader
+                            launchExternal("폴더 내보내기 완료: ${destRoot.absolutePath}") {
+                                LibraryExporter.exportPostsToCleanFolderTree(listOf(currentPost), destRoot)
                             }
                         },
                     )

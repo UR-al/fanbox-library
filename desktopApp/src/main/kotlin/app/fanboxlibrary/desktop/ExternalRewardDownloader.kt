@@ -1,11 +1,15 @@
 package app.fanboxlibrary.desktop
 
+import app.fanboxlibrary.shared.ArchiveUnpacker
 import app.fanboxlibrary.shared.ImportReport
 import app.fanboxlibrary.shared.ImportSource
 import app.fanboxlibrary.shared.LibraryAsset
 import app.fanboxlibrary.shared.LibraryPost
 import app.fanboxlibrary.shared.LibraryStore
+import app.fanboxlibrary.shared.MegaDownloader
+import app.fanboxlibrary.shared.PasswordExtractor
 import app.fanboxlibrary.shared.PostDraft
+import app.fanboxlibrary.shared.UnpackedEntryFile
 import app.fanboxlibrary.shared.ZipExplorer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -575,6 +579,7 @@ internal object ExternalRewardDownloader {
         store: LibraryStore,
         draft: PostDraft,
         rewards: List<ResolvedRewardItem>,
+        passwordCandidates: List<String> = emptyList(),
         onProgress: (String) -> Unit,
     ): ImportReport = withContext(Dispatchers.IO) {
         var totalAdded = 0
@@ -586,55 +591,63 @@ internal object ExternalRewardDownloader {
         try {
             for ((idx, item) in rewards.withIndex()) {
                 if (!isActive) throw CancellationException()
-                if (item.kind == ExternalLinkKind.MEGA) {
-                    warnings.add("${item.label}: MEGA 링크는 브라우저 암호 복호화가 필요하여 건너뛰었습니다.")
-                    totalSkipped++
-                    continue
-                }
-
                 val prefix = if (rewards.size > 1) "(${idx + 1}/${rewards.size}) " else ""
                 onProgress("${prefix}${item.label} 연결 중…")
 
                 val dlFile = File(tempDir, "download_${idx + 1}.bin")
                 var headerFileName = ""
-                var contentType = ""
 
-                val req = Request.Builder()
-                    .url(item.directDownloadUrl)
-                    .header("User-Agent", DesktopFanboxSession.USER_AGENT)
-                    .header("Accept", "*/*")
-                    .build()
-
-                downloadHttp.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        throw IOException("${item.label} 다운로드 실패 (HTTP ${resp.code})")
+                if (item.kind == ExternalLinkKind.MEGA) {
+                    val megaFn = runCatching {
+                        MegaDownloader.downloadDecryptedToFile(item.originalUrl, dlFile) { downloaded, totalBytes, fn ->
+                            val mb = downloaded / 1048576.0
+                            val pct = if (totalBytes > 0) " (${(downloaded * 100 / totalBytes).coerceIn(0, 100)}%)" else ""
+                            onProgress("${prefix}MEGA 복호화 다운로드 · $fn · %.1f MB%s".format(mb, pct))
+                        }
+                    }.getOrElse { err ->
+                        warnings.add("${item.label}: ${err.localizedMessage ?: "MEGA 다운로드 실패"}")
+                        totalSkipped++
+                        continue
                     }
-                    contentType = resp.header("Content-Type").orEmpty().lowercase(Locale.ROOT)
-                    if (contentType.contains("text/html")) {
-                        throw IOException("${item.label}: 직접 파일 대신 웹 페이지가 반환되었습니다. 링크 권한이나 비밀번호를 확인해 주세요.")
-                    }
-                    headerFileName = parseContentDispositionFileName(resp.header("Content-Disposition"))
-                        ?: resp.request.url.pathSegments.lastOrNull()?.takeIf { it.contains('.') }.orEmpty()
+                    headerFileName = megaFn
+                } else {
+                    val req = Request.Builder()
+                        .url(item.directDownloadUrl)
+                        .header("User-Agent", DesktopFanboxSession.USER_AGENT)
+                        .header("Accept", "*/*")
+                        .build()
 
-                    val totalBytes = resp.body?.contentLength() ?: -1L
-                    val input = resp.body?.byteStream() ?: throw IOException("빈 응답입니다.")
-                    FileOutputStream(dlFile).use { out ->
-                        val buf = ByteArray(64 * 1024)
-                        var downloaded = 0L
-                        var lastUiTick = 0L
-                        while (true) {
-                            if (!isActive) throw CancellationException()
-                            val n = input.read(buf)
-                            if (n < 0) break
-                            if (n == 0) continue
-                            out.write(buf, 0, n)
-                            downloaded += n
-                            val now = System.currentTimeMillis()
-                            if (now - lastUiTick >= 220L) {
-                                lastUiTick = now
-                                val mb = downloaded / 1048576.0
-                                val pct = if (totalBytes > 0) " (${(downloaded * 100 / totalBytes).coerceIn(0, 100)}%)" else ""
-                                onProgress("${prefix}${item.label} 다운로드 중 · %.1f MB%s".format(mb, pct))
+                    downloadHttp.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) {
+                            throw IOException("${item.label} 다운로드 실패 (HTTP ${resp.code})")
+                        }
+                        val contentType = resp.header("Content-Type").orEmpty().lowercase(Locale.ROOT)
+                        if (contentType.contains("text/html")) {
+                            throw IOException("${item.label}: 직접 파일 대신 웹 페이지가 반환되었습니다. 링크 권한이나 비밀번호를 확인해 주세요.")
+                        }
+                        headerFileName = parseContentDispositionFileName(resp.header("Content-Disposition"))
+                            ?: resp.request.url.pathSegments.lastOrNull()?.takeIf { it.contains('.') }.orEmpty()
+
+                        val totalBytes = resp.body?.contentLength() ?: -1L
+                        val input = resp.body?.byteStream() ?: throw IOException("빈 응답입니다.")
+                        FileOutputStream(dlFile).use { out ->
+                            val buf = ByteArray(64 * 1024)
+                            var downloaded = 0L
+                            var lastUiTick = 0L
+                            while (true) {
+                                if (!isActive) throw CancellationException()
+                                val n = input.read(buf)
+                                if (n < 0) break
+                                if (n == 0) continue
+                                out.write(buf, 0, n)
+                                downloaded += n
+                                val now = System.currentTimeMillis()
+                                if (now - lastUiTick >= 220L) {
+                                    lastUiTick = now
+                                    val mb = downloaded / 1048576.0
+                                    val pct = if (totalBytes > 0) " (${(downloaded * 100 / totalBytes).coerceIn(0, 100)}%)" else ""
+                                    onProgress("${prefix}${item.label} 다운로드 중 · %.1f MB%s".format(mb, pct))
+                                }
                             }
                         }
                     }
@@ -646,6 +659,7 @@ internal object ExternalRewardDownloader {
                     file = dlFile,
                     suggestedName = headerFileName.ifBlank { sanitizeFileStem(item.label) },
                     tempWorkDir = File(tempDir, "unpack_${idx + 1}").apply { mkdirs() },
+                    passwordCandidates = passwordCandidates,
                     onProgress = { msg -> onProgress("$prefix$msg") },
                 )
                 totalAdded += rep.added
@@ -661,23 +675,59 @@ internal object ExternalRewardDownloader {
         ImportReport(totalAdded, totalReused, totalSkipped, warnings)
     }
 
+    /**
+     * Imports a post attachment stream, automatically unlocking encrypted .zip / .7z archives
+     * when password candidates were found in the post text!
+     */
+    fun ingestAttachmentWithSmartUnpack(
+        store: LibraryStore,
+        draft: PostDraft,
+        fileName: String,
+        passwordCandidates: List<String>,
+        openStream: () -> java.io.InputStream,
+        onProgress: (String) -> Unit = {},
+    ): ImportReport {
+        val lower = fileName.lowercase(Locale.ROOT)
+        val shouldInspectArchive = lower.endsWith(".7z") ||
+            (lower.endsWith(".zip") && passwordCandidates.isNotEmpty()) ||
+            lower.endsWith(".pdf")
+        if (!shouldInspectArchive) {
+            return openStream().use { inp ->
+                store.importManaged(draft, listOf(ImportSource(fileName, "원본/$fileName") { inp }))
+            }
+        }
+        val tempDir = Files.createTempDirectory("fanboxlib-att-").toFile()
+        try {
+            val tmpFile = File(tempDir, sanitizeFileName(fileName))
+            openStream().use { inp -> FileOutputStream(tmpFile).use { out -> inp.copyTo(out, 64 * 1024) } }
+            if (lower.endsWith(".zip") && !ArchiveUnpacker.isZipEncrypted(tmpFile)) {
+                return store.importManaged(draft, listOf(ImportSource(fileName, "원본/$fileName") { tmpFile.inputStream() }))
+            }
+            return ingestDownloadedFile(store, draft, tmpFile, fileName, File(tempDir, "work"), passwordCandidates, onProgress)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
     private fun ingestDownloadedFile(
         store: LibraryStore,
         draft: PostDraft,
         file: File,
         suggestedName: String,
         tempWorkDir: File,
+        passwordCandidates: List<String> = emptyList(),
         onProgress: (String) -> Unit,
     ): ImportReport {
         val magic = ByteArray(12)
         val readLen = file.inputStream().use { it.read(magic) }.coerceAtLeast(0)
         val isZip = readLen >= 4 && magic[0] == 0x50.toByte() && magic[1] == 0x4B.toByte() &&
             magic[2] == 0x03.toByte() && magic[3] == 0x04.toByte()
+        val is7z = ArchiveUnpacker.isSevenZipMagic(magic, readLen)
         val isPdf = readLen >= 4 && magic[0] == '%'.code.toByte() && magic[1] == 'P'.code.toByte() &&
             magic[2] == 'D'.code.toByte() && magic[3] == 'F'.code.toByte()
 
-        if (isZip) {
-            return ingestZipArchive(store, draft, file, tempWorkDir, depth = 0, onProgress = onProgress)
+        if (isZip || is7z) {
+            return ingestArchive(store, draft, file, isSevenZip = is7z, tempWorkDir, depth = 0, passwordCandidates, onProgress)
         }
         if (isPdf) {
             val cleanPdfName = ensureExtension(suggestedName, "pdf")
@@ -694,19 +744,37 @@ internal object ExternalRewardDownloader {
         )
     }
 
-    private fun ingestZipArchive(
+    private fun ingestArchive(
         store: LibraryStore,
         draft: PostDraft,
-        zipFile: File,
+        archiveFile: File,
+        isSevenZip: Boolean,
         tempWorkDir: File,
         depth: Int,
+        passwordCandidates: List<String>,
         onProgress: (String) -> Unit,
     ): ImportReport {
-        val entries = runCatching { ZipExplorer.listEntries(zipFile) }.getOrDefault(emptyList())
-            .sortedWith { a, b -> naturalComparator.compare(a.displayName, b.displayName) }
+        val unpacked: List<UnpackedEntryFile> = runCatching {
+            if (isSevenZip) {
+                ArchiveUnpacker.extractSevenZip(archiveFile, File(tempWorkDir, "ex7z_$depth"), passwordCandidates, onProgress)
+            } else {
+                ArchiveUnpacker.extractZipWithPasswords(archiveFile, File(tempWorkDir, "exzip_$depth"), passwordCandidates, onProgress)
+            }
+        }.getOrElse { err ->
+            val fallbackExt = if (isSevenZip) "7z" else "zip"
+            val rep = store.importManaged(
+                draft,
+                listOf(ImportSource("reward.$fallbackExt", "원본/reward.$fallbackExt") { archiveFile.inputStream() }),
+            )
+            return rep.copy(warnings = rep.warnings + (err.localizedMessage ?: "압축 해제 실패 — 원본 압축파일로 보관했습니다."))
+        }
 
-        if (entries.isEmpty()) {
-            return store.importManaged(draft, listOf(ImportSource("reward.zip", "원본/reward.zip") { zipFile.inputStream() }))
+        if (unpacked.isEmpty()) {
+            val fallbackExt = if (isSevenZip) "7z" else "zip"
+            return store.importManaged(
+                draft,
+                listOf(ImportSource("reward.$fallbackExt", "원본/reward.$fallbackExt") { archiveFile.inputStream() }),
+            )
         }
 
         var added = 0
@@ -718,15 +786,10 @@ internal object ExternalRewardDownloader {
         val directNames = mutableListOf<String>()
         val usedNames = hashSetOf<String>()
 
-        for ((idx, entry) in entries.withIndex()) {
-            val leaf = entry.displayName.substringAfterLast('/')
-            if (leaf.startsWith(".") || leaf.equals("Thumbs.db", ignoreCase = true) || leaf.equals("desktop.ini", ignoreCase = true)) {
-                continue
-            }
+        for ((idx, entry) in unpacked.withIndex()) {
+            val leaf = entry.leafName
             val ext = leaf.substringAfterLast('.', "").lowercase(Locale.ROOT)
-            onProgress("압축 해제 중 (${idx + 1}/${entries.size}) · $leaf")
-            val extracted = File(tempWorkDir, "e_${depth}_${idx}_$leaf")
-            runCatching { ZipExplorer.extractEntryToFile(zipFile, entry.entryName, extracted) }.onFailure { continue }
+            val extracted = entry.file
 
             when {
                 ext == "pdf" -> {
@@ -744,13 +807,15 @@ internal object ExternalRewardDownloader {
                     warnings.addAll(pdfRep.warnings)
                     extracted.delete()
                 }
-                ext == "zip" && depth < 1 -> {
-                    val subRep = ingestZipArchive(
+                (ext == "zip" || ext == "7z") && depth < 1 -> {
+                    val subRep = ingestArchive(
                         store = store,
                         draft = draft,
-                        zipFile = extracted,
-                        tempWorkDir = File(tempWorkDir, "subzip_$idx").apply { mkdirs() },
+                        archiveFile = extracted,
+                        isSevenZip = ext == "7z",
+                        tempWorkDir = File(tempWorkDir, "sub_$idx").apply { mkdirs() },
                         depth = depth + 1,
+                        passwordCandidates = passwordCandidates,
                         onProgress = onProgress,
                     )
                     added += subRep.added
@@ -760,16 +825,17 @@ internal object ExternalRewardDownloader {
                     extracted.delete()
                 }
                 ext in directFileExtensions -> {
+                    val isImg = ext in setOf("jpg", "jpeg", "png", "webp", "gif", "bmp", "avif")
                     val uniqueName = uniqueLeafName(
-                        if (entry.isImage) "%03d_%s".format(idx + 1, leaf) else leaf,
+                        if (isImg) "%03d_%s".format(idx + 1, leaf) else leaf,
                         usedNames,
                     )
-                    val pathHint = if (entry.displayName.contains("textless", ignoreCase = true) ||
-                        entry.displayName.contains("무자막")
+                    val pathHint = if (entry.displayPath.contains("textless", ignoreCase = true) ||
+                        entry.displayPath.contains("무자막")
                     ) {
-                        "textless/${entry.displayName}"
+                        "textless/${entry.displayPath}"
                     } else {
-                        "원본/${entry.displayName}"
+                        "원본/${entry.displayPath}"
                     }
                     directBatch.add(extracted)
                     directNames.add(uniqueName)

@@ -18,6 +18,8 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Collections
+import androidx.compose.material.icons.rounded.DeleteOutline
+import androidx.compose.material.icons.rounded.DriveFolderUpload
 import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.FolderZip
 import androidx.compose.material.icons.rounded.GridView
@@ -25,6 +27,8 @@ import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.MergeType
 import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Star
+import androidx.compose.material.icons.rounded.StarBorder
 import androidx.compose.material.icons.automirrored.rounded.Sort
 import androidx.compose.material.icons.rounded.ViewAgenda
 import androidx.compose.material3.*
@@ -54,6 +58,7 @@ internal fun LibraryPost.imageCount() = assets.count { it.isImage }
 
 internal enum class SmartFilter(val label: String) {
     ALL("전체 보관함"),
+    FAVORITES("★ 즐겨찾기"),
     TEXTLESS("Textless 보유작"),
     ATTACHMENTS("PSD · ZIP 포함"),
 }
@@ -74,6 +79,7 @@ internal fun computeVisiblePosts(
 ): List<LibraryPost> {
     val bySmart = when (smartFilter) {
         SmartFilter.ALL -> posts
+        SmartFilter.FAVORITES -> posts.filter { it.isFavorite }
         SmartFilter.TEXTLESS -> posts.filter { it.hasTextless() }
         SmartFilter.ATTACHMENTS -> posts.filter { it.attachmentCount() > 0 }
     }
@@ -143,8 +149,12 @@ internal fun Shelf(
     onBrowse: () -> Unit,
     onLinkFolder: () -> Unit,
     onMergeSeries: (targetId: String, sourceIds: Set<String>, seriesTitle: String) -> Unit = { _, _, _ -> },
+    onToggleFavorite: (String) -> Unit = {},
+    onDeletePost: (LibraryPost) -> Unit = {},
+    onExportBackup: (List<LibraryPost>) -> Unit = {},
 ) {
     val colors = LocalGalleryColors.current
+    val favCount = remember(posts) { posts.count { it.isFavorite } }
     val textlessCount = remember(posts) { posts.count { it.hasTextless() } }
     val attachPostCount = remember(posts) { posts.count { it.attachmentCount() > 0 } }
     val totalImages = remember(posts) { posts.sumOf { it.imageCount() } }
@@ -154,10 +164,12 @@ internal fun Shelf(
     var mergeMode by remember { mutableStateOf(false) }
     var mergeSelected by remember { mutableStateOf<List<String>>(emptyList()) }
     var showMergeDialog by remember { mutableStateOf(false) }
+    var postPendingDelete by remember { mutableStateOf<LibraryPost?>(null) }
 
     val bySmart = remember(posts, smartFilter) {
         when (smartFilter) {
             SmartFilter.ALL -> posts
+            SmartFilter.FAVORITES -> posts.filter { it.isFavorite }
             SmartFilter.TEXTLESS -> posts.filter { it.hasTextless() }
             SmartFilter.ATTACHMENTS -> posts.filter { it.attachmentCount() > 0 }
         }
@@ -195,6 +207,15 @@ internal fun Shelf(
                 selected = smartFilter == SmartFilter.ALL && activeArtist == null,
                 tint = colors.accent,
                 onClick = { onSmartFilter(SmartFilter.ALL); onCreator(null) },
+            )
+            Spacer(Modifier.height(3.dp))
+            SmartNavItem(
+                icon = Icons.Rounded.Star,
+                label = SmartFilter.FAVORITES.label,
+                count = favCount,
+                selected = smartFilter == SmartFilter.FAVORITES && activeArtist == null,
+                tint = Color(0xFFF59E0B),
+                onClick = { onSmartFilter(SmartFilter.FAVORITES); onCreator(null) },
             )
             Spacer(Modifier.height(3.dp))
             SmartNavItem(
@@ -453,6 +474,19 @@ internal fun Shelf(
                     }
                 }
 
+                if (visiblePosts.isNotEmpty()) {
+                    OutlinedButton(
+                        onClick = { onExportBackup(visiblePosts) },
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, colors.border),
+                        contentPadding = PaddingValues(horizontal = 11.dp, vertical = 6.dp),
+                    ) {
+                        Icon(Icons.Rounded.DriveFolderUpload, null, Modifier.size(16.dp), tint = colors.emerald)
+                        Spacer(Modifier.width(5.dp))
+                        Text("폴더 백업", style = MaterialTheme.typography.labelMedium, color = colors.ink)
+                    }
+                }
+
                 // Grid Size Toggle
                 OutlinedIconButton(
                     onClick = onToggleGrid,
@@ -555,6 +589,8 @@ internal fun Shelf(
                             post = post,
                             mergeMode = mergeMode,
                             selectedForMerge = isSelectedForMerge,
+                            onToggleFavorite = { onToggleFavorite(post.id) },
+                            onRequestDelete = { postPendingDelete = post },
                             onClick = {
                                 if (mergeMode) {
                                     mergeSelected = if (isSelectedForMerge) mergeSelected - post.id else mergeSelected + post.id
@@ -567,6 +603,34 @@ internal fun Shelf(
                 }
             }
         }
+    }
+
+    if (postPendingDelete != null) {
+        val target = postPendingDelete!!
+        AlertDialog(
+            onDismissRequest = { postPendingDelete = null },
+            containerColor = colors.surface,
+            titleContentColor = colors.ink,
+            textContentColor = colors.ink,
+            title = { Text("작품 통째 삭제") },
+            text = {
+                Text(
+                    "‘${target.titleLabel()}’ (${target.artistLabel()}) 작품을 내 보관함에서 삭제할까요?\n(앱 내부 사본만 정리되며, 외부 작가 폴더의 원본 파일은 절대 삭제되지 않습니다.)",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = colors.muted,
+                )
+            },
+            confirmButton = {
+                Button(
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                    onClick = {
+                        postPendingDelete = null
+                        onDeletePost(target)
+                    },
+                ) { Text("작품 삭제") }
+            },
+            dismissButton = { TextButton(onClick = { postPendingDelete = null }) { Text("취소") } },
+        )
     }
 
     if (showMergeDialog && mergeSelected.size >= 2) {
@@ -744,7 +808,7 @@ private fun ArtistFolderCard(
     val interaction = remember { MutableInteractionSource() }
     val hovered by interaction.collectIsHoveredAsState()
     val coverAsset = remember(artistPosts) {
-        artistPosts.firstNotNullOfOrNull { p -> p.assets.firstOrNull { it.isImage } }
+        artistPosts.firstNotNullOfOrNull { p -> p.coverImage() }
     }
     val totalImgs = remember(artistPosts) { artistPosts.sumOf { it.imageCount() } }
     val avatarColor = remember(artistName) { artistColor(artistName) }
@@ -801,6 +865,8 @@ private fun CoverCard(
     post: LibraryPost,
     mergeMode: Boolean = false,
     selectedForMerge: Boolean = false,
+    onToggleFavorite: () -> Unit = {},
+    onRequestDelete: () -> Unit = {},
     onClick: () -> Unit,
 ) {
     val colors = LocalGalleryColors.current
@@ -809,10 +875,7 @@ private fun CoverCard(
     val imgCount = remember(post) { post.imageCount() }
     val attachCount = remember(post) { post.attachmentCount() }
     val textless = remember(post) { post.hasTextless() }
-    val coverAsset = remember(post) {
-        post.assets.firstOrNull { it.isImage && !it.variant.equals("textless", true) }
-            ?: post.assets.firstOrNull { it.isImage }
-    }
+    val coverAsset = remember(post) { post.coverImage() }
 
     Column(
         modifier = Modifier
@@ -881,23 +944,64 @@ private fun CoverCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                if (textless) {
-                    OverlayPill(
-                        text = "Textless",
-                        bg = Color(0xCC059669),
-                        fg = Color.White,
-                        icon = Icons.Rounded.AutoAwesome,
-                    )
-                } else {
-                    Spacer(Modifier.width(1.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (post.isFavorite || hovered) {
+                        Box(
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(Color(0xB80E1016))
+                                .clickable(onClick = onToggleFavorite)
+                                .padding(4.dp),
+                        ) {
+                            Icon(
+                                if (post.isFavorite) Icons.Rounded.Star else Icons.Rounded.StarBorder,
+                                contentDescription = "즐겨찾기",
+                                tint = if (post.isFavorite) Color(0xFFFBBF24) else Color.White,
+                                modifier = Modifier.size(15.dp),
+                            )
+                        }
+                    }
+                    if (textless) {
+                        OverlayPill(
+                            text = "Textless",
+                            bg = Color(0xCC059669),
+                            fg = Color.White,
+                            icon = Icons.Rounded.AutoAwesome,
+                        )
+                    }
                 }
-                if (imgCount > 0) {
-                    OverlayPill(
-                        text = "$imgCount",
-                        bg = Color(0xB80E1016),
-                        fg = Color.White,
-                        icon = Icons.Rounded.Image,
-                    )
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (post.lastReadPage > 0 && imgCount > 1) {
+                        OverlayPill(
+                            text = "이어보기 p.${post.lastReadPage + 1}",
+                            bg = Color(0xCC2563EB),
+                            fg = Color.White,
+                        )
+                    }
+                    if (imgCount > 0) {
+                        OverlayPill(
+                            text = "$imgCount",
+                            bg = Color(0xB80E1016),
+                            fg = Color.White,
+                            icon = Icons.Rounded.Image,
+                        )
+                    }
+                    if (hovered && !mergeMode) {
+                        Box(
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(Color(0xCC7F1D1D))
+                                .clickable(onClick = onRequestDelete)
+                                .padding(4.dp),
+                        ) {
+                            Icon(
+                                Icons.Rounded.DeleteOutline,
+                                contentDescription = "작품 삭제",
+                                tint = Color.White,
+                                modifier = Modifier.size(14.dp),
+                            )
+                        }
+                    }
                 }
             }
 

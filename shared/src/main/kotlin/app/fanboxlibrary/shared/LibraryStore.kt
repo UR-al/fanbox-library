@@ -1,5 +1,9 @@
 package app.fanboxlibrary.shared
 
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -23,8 +27,65 @@ import java.util.zip.ZipFile
 class LibraryStore(root: File) {
     private val root = root.canonicalFile
     private val indexFile = File(this.root, "library.index")
+    private val metaFile = File(this.root, "library.meta")
     private val managed = File(this.root, "files")
     private val staging = File(this.root, "staging")
+
+    private class UserMeta {
+        val favoritePosts = linkedSetOf<String>()
+        val lastPages = linkedMapOf<String, Int>()
+        val coverAssets = linkedMapOf<String, String>()
+        val bookmarkedAssets = linkedMapOf<String, MutableSet<String>>()
+    }
+
+    private fun loadMeta(): UserMeta {
+        val m = UserMeta()
+        if (!metaFile.isFile) return m
+        runCatching {
+            DataInputStream(BufferedInputStream(metaFile.inputStream())).use { inp ->
+                if (inp.readInt() != META_MAGIC || inp.readInt() != 1) return m
+                repeat(inp.readInt().coerceIn(0, 500_000)) { m.favoritePosts.add(inp.readUTF()) }
+                repeat(inp.readInt().coerceIn(0, 500_000)) { m.lastPages[inp.readUTF()] = inp.readInt() }
+                repeat(inp.readInt().coerceIn(0, 500_000)) { m.coverAssets[inp.readUTF()] = inp.readUTF() }
+                repeat(inp.readInt().coerceIn(0, 500_000)) {
+                    val pid = inp.readUTF()
+                    val set = linkedSetOf<String>()
+                    repeat(inp.readInt().coerceIn(0, 100_000)) { set.add(inp.readUTF()) }
+                    if (set.isNotEmpty()) m.bookmarkedAssets[pid] = set
+                }
+            }
+        }
+        return m
+    }
+
+    private fun saveMeta(m: UserMeta) {
+        Files.createDirectories(root.toPath())
+        val tmp = File.createTempFile("meta-", ".part", root)
+        try {
+            FileOutputStream(tmp).use { fos ->
+                val out = DataOutputStream(BufferedOutputStream(fos))
+                out.writeInt(META_MAGIC)
+                out.writeInt(1)
+                out.writeInt(m.favoritePosts.size)
+                m.favoritePosts.forEach { out.writeUTF(it) }
+                out.writeInt(m.lastPages.size)
+                m.lastPages.forEach { (k, v) -> out.writeUTF(k); out.writeInt(v) }
+                out.writeInt(m.coverAssets.size)
+                m.coverAssets.forEach { (k, v) -> out.writeUTF(k); out.writeUTF(v) }
+                out.writeInt(m.bookmarkedAssets.size)
+                m.bookmarkedAssets.forEach { (pid, set) ->
+                    out.writeUTF(pid)
+                    out.writeInt(set.size)
+                    set.forEach { out.writeUTF(it) }
+                }
+                out.flush()
+                fos.fd.sync()
+            }
+            Files.move(tmp.toPath(), metaFile.toPath(), ATOMIC_MOVE, REPLACE_EXISTING)
+        } finally {
+            tmp.delete()
+        }
+    }
 
     private fun <T> locked(action: (LibraryIndex) -> T): T =
         synchronized(locks.computeIfAbsent(root.path) { Any() }) {
@@ -40,6 +101,7 @@ class LibraryStore(root: File) {
 
     /** Only the immutable snapshot is exposed to the caller. Missing external files remain visible. */
     fun posts(): List<LibraryPost> = locked { index ->
+        val meta = loadMeta()
         val available = HashMap<String, String>()
         index.posts.values.map { record ->
             val assets = record.entries.values.map { entry ->
@@ -54,7 +116,18 @@ class LibraryStore(root: File) {
                 }
                 LibraryAsset(entry.id, entry.name, entry.hash, blob.size, path, entry.variant, Media.isImage(entry.name))
             }
-            LibraryPost(record.id, record.creator, record.title, record.year, record.url, assets)
+            LibraryPost(
+                id = record.id,
+                creator = record.creator,
+                title = record.title,
+                year = record.year,
+                sourceUrl = record.url,
+                assets = assets,
+                isFavorite = record.id in meta.favoritePosts,
+                lastReadPage = meta.lastPages[record.id] ?: 0,
+                coverAssetId = meta.coverAssets[record.id],
+                bookmarkedAssetIds = meta.bookmarkedAssets[record.id]?.toSet().orEmpty(),
+            )
         }.sortedWith(compareByDescending<LibraryPost> { it.year ?: 0 }.thenBy { it.creator }.thenBy { it.title }.thenBy { it.id })
     }
 
@@ -167,6 +240,7 @@ class LibraryStore(root: File) {
     private fun checkMedia(file: File, name: String) {
         if (file.length() == 0L) throw IOException("빈 파일입니다.")
         if (!name.endsWith(".zip", ignoreCase = true)) return
+        if (ArchiveUnpacker.isZipEncrypted(file)) return
         // Older Japanese archives may use CP932 names. A lossless byte mapping suffices for CRC checks;
         // entries carrying the UTF-8 flag are decoded by ZipFile itself.
         ZipFile(file, Charsets.ISO_8859_1).use { archive ->
@@ -347,6 +421,102 @@ class LibraryStore(root: File) {
         index.saveTo(indexFile)
     }
 
+    fun toggleFavoritePost(postId: String): Boolean = locked {
+        val meta = loadMeta()
+        val nowFav = if (!meta.favoritePosts.remove(postId)) {
+            meta.favoritePosts.add(postId)
+            true
+        } else false
+        saveMeta(meta)
+        nowFav
+    }
+
+    fun toggleBookmarkAsset(postId: String, assetId: String): Boolean = locked {
+        val meta = loadMeta()
+        val set = meta.bookmarkedAssets.getOrPut(postId) { linkedSetOf() }
+        val nowMarked = if (!set.remove(assetId)) {
+            set.add(assetId)
+            true
+        } else {
+            if (set.isEmpty()) meta.bookmarkedAssets.remove(postId)
+            false
+        }
+        saveMeta(meta)
+        nowMarked
+    }
+
+    fun saveLastReadPage(postId: String, pageIndex: Int) = locked {
+        val meta = loadMeta()
+        val safePage = pageIndex.coerceAtLeast(0)
+        if (meta.lastPages[postId] != safePage) {
+            if (safePage == 0) meta.lastPages.remove(postId) else meta.lastPages[postId] = safePage
+            saveMeta(meta)
+        }
+    }
+
+    fun setCoverAsset(postId: String, assetId: String?) = locked {
+        val meta = loadMeta()
+        if (assetId.isNullOrBlank()) meta.coverAssets.remove(postId)
+        else meta.coverAssets[postId] = assetId
+        saveMeta(meta)
+    }
+
+    /** Deletes an entire post and cleans up unreferenced app-managed blobs (never deletes external linked files). */
+    fun deletePost(postId: String): Boolean = locked { index ->
+        val post = index.posts.remove(postId) ?: return@locked false
+        val touchedHashes = hashSetOf<String>()
+        post.entries.values.forEach { entry ->
+            index.relocated.add(post.id to entry.id)
+            touchedHashes.add(entry.hash)
+        }
+        val stillReferenced = hashSetOf<String>()
+        index.posts.values.forEach { p -> p.entries.values.forEach { stillReferenced.add(it.hash) } }
+        for (hash in touchedHashes) {
+            if (hash !in stillReferenced) {
+                index.blobs.remove(hash)
+                val blobFile = managedFile(hash)
+                if (blobFile.isFile && blobFile.canonicalFile.toPath().startsWith(managed.canonicalFile.toPath())) {
+                    runCatching { blobFile.delete() }
+                }
+            }
+        }
+        index.saveTo(indexFile)
+
+        val meta = loadMeta()
+        meta.favoritePosts.remove(postId)
+        meta.lastPages.remove(postId)
+        meta.coverAssets.remove(postId)
+        meta.bookmarkedAssets.remove(postId)
+        saveMeta(meta)
+        true
+    }
+
+    /** Moves an asset backward (-1) or forward (+1) in the post's reading order. */
+    fun moveAsset(postId: String, assetId: String, delta: Int) = locked { index ->
+        val post = index.posts[postId] ?: return@locked
+        val list = post.entries.entries.map { it.key to it.value }.toMutableList()
+        val idx = list.indexOfFirst { it.first == assetId }
+        if (idx < 0) return@locked
+        val newIdx = (idx + delta).coerceIn(0, list.lastIndex)
+        if (newIdx == idx) return@locked
+        val item = list.removeAt(idx)
+        list.add(newIdx, item)
+        post.entries.clear()
+        list.forEach { (k, v) -> post.entries[k] = v }
+        index.saveTo(indexFile)
+    }
+
+    /** Sorts all assets inside a post by natural filename order (1, 2, ..., 10). */
+    fun sortPostAssetsNaturally(postId: String) = locked { index ->
+        val post = index.posts[postId] ?: return@locked
+        val sorted = post.entries.entries
+            .sortedWith { a, b -> naturalCompare(a.value.name, b.value.name) }
+            .map { it.key to it.value }
+        post.entries.clear()
+        sorted.forEach { (k, v) -> post.entries[k] = v }
+        index.saveTo(indexFile)
+    }
+
     private fun prepareExisting(raw: File, variant: String): Prepared {
         val file = raw.canonicalFile
         require(file.isFile && !file.toPath().startsWith(root.toPath())) { "참조할 수 있는 외부 파일을 선택하세요." }
@@ -421,6 +591,7 @@ class LibraryStore(root: File) {
     }
 
     companion object {
+        private const val META_MAGIC = 0x46424D54
         private val locks = ConcurrentHashMap<String, Any>()
         private val variants = setOf("원본 미확인", "원본", "textless", "SAMPLE", "저해상도")
         private val pieces = Regex("[0-9]+|[^0-9]+")

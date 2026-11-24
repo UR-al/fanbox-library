@@ -27,7 +27,15 @@ data class LibraryPost(
     val year: Int?,
     val sourceUrl: String,
     val assets: List<LibraryAsset>,
-)
+    val isFavorite: Boolean = false,
+    val lastReadPage: Int = 0,
+    val coverAssetId: String? = null,
+    val bookmarkedAssetIds: Set<String> = emptySet(),
+) {
+    fun coverImage(): LibraryAsset? =
+        assets.firstOrNull { it.isImage && it.id == coverAssetId }
+            ?: assets.firstOrNull { it.isImage }
+}
 
 data class LibraryAsset(
     val id: String,

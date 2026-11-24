@@ -12,12 +12,20 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Bookmark
+import androidx.compose.material.icons.rounded.BookmarkBorder
 import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Compare
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.FolderZip
+import androidx.compose.material.icons.rounded.Fullscreen
+import androidx.compose.material.icons.rounded.FullscreenExit
+import androidx.compose.material.icons.rounded.MenuBook
+import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Star
+import androidx.compose.material.icons.rounded.StarBorder
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.ViewColumn
 import androidx.compose.material.icons.rounded.ViewDay
@@ -131,8 +139,13 @@ internal fun loadImage(file: File, hash: String, edge: Int): Preview = key(file.
     preview
 }
 
-private enum class ReaderMode { SINGLE, WEBTOON, COMPARE, ATTACHMENTS }
-private enum class VariantFilter(val label: String) { ALL("전체"), ORIGINAL("원본"), TEXTLESS("Textless") }
+private enum class ReaderMode { SINGLE, SPREAD, WEBTOON, COMPARE, ATTACHMENTS }
+private enum class VariantFilter(val label: String) {
+    ALL("전체"),
+    ORIGINAL("원본"),
+    TEXTLESS("Textless"),
+    BOOKMARKED("♥ 북마크"),
+}
 
 private class FractionClipShape(private val fraction: Float) : Shape {
     override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline {
@@ -156,27 +169,75 @@ internal fun PostReader(
     openPsd: (LibraryAsset) -> Unit = {},
     unpackPdf: (LibraryAsset) -> Unit = {},
     onDeleteAsset: (LibraryAsset) -> Unit = {},
+    isFullscreen: Boolean = false,
+    onToggleFullscreen: () -> Unit = {},
+    onSaveLastPage: (Int) -> Unit = {},
+    onToggleFavoritePost: () -> Unit = {},
+    onToggleBookmarkAsset: (LibraryAsset) -> Unit = {},
+    onSetCoverAsset: (LibraryAsset) -> Unit = {},
+    onMoveAsset: (LibraryAsset, Int) -> Unit = { _, _ -> },
+    onSortAssetsNaturally: () -> Unit = {},
+    onDeleteWholePost: () -> Unit = {},
+    onExportCbz: () -> Unit = {},
+    onExportFolder: () -> Unit = {},
 ) {
     val colors = LocalGalleryColors.current
     val allImages = remember(post) { post.assets.filter { it.isImage } }
     val originalImages = remember(allImages) { allImages.filterNot { it.variant.equals("textless", true) } }
     val textlessImages = remember(allImages) { allImages.filter { it.variant.equals("textless", true) } }
+    val bookmarkedImages = remember(allImages, post.bookmarkedAssetIds) { allImages.filter { it.id in post.bookmarkedAssetIds } }
     val hasComparePair = originalImages.isNotEmpty() && textlessImages.isNotEmpty()
     val attachments = remember(post) { post.assets.filterNot { it.isImage } }
 
     var mode by remember(post.id) {
         mutableStateOf(if (allImages.isNotEmpty()) ReaderMode.SINGLE else ReaderMode.ATTACHMENTS)
     }
+    var rtlMode by remember { mutableStateOf(false) }
+    var spreadCoverAlone by remember { mutableStateOf(true) }
+    var moreMenuOpen by remember { mutableStateOf(false) }
+    var pendingDeleteWholePost by remember { mutableStateOf(false) }
+
     var variantFilter by remember(post.id) { mutableStateOf(VariantFilter.ALL) }
-    val images = remember(allImages, originalImages, textlessImages, variantFilter) {
+    val images = remember(allImages, originalImages, textlessImages, bookmarkedImages, variantFilter) {
         when (variantFilter) {
             VariantFilter.ALL -> allImages
             VariantFilter.ORIGINAL -> originalImages.ifEmpty { allImages }
             VariantFilter.TEXTLESS -> textlessImages.ifEmpty { allImages }
+            VariantFilter.BOOKMARKED -> bookmarkedImages.ifEmpty { allImages }
         }
     }
-    var page by remember(post.id, variantFilter) { mutableStateOf(0) }
+    var page by remember(post.id) {
+        mutableStateOf(post.lastReadPage.coerceIn(0, (allImages.size - 1).coerceAtLeast(0)))
+    }
     val active = page.coerceIn(0, (images.size - 1).coerceAtLeast(0))
+
+    // Persist reading progress automatically (#5 Resume reading)
+    LaunchedEffect(post.id, active, variantFilter) {
+        if (variantFilter == VariantFilter.ALL && allImages.size > 1) {
+            onSaveLastPage(active)
+        }
+    }
+
+    fun stepForward() {
+        if (images.isEmpty()) return
+        page = when (mode) {
+            ReaderMode.SPREAD -> {
+                val delta = if (spreadCoverAlone && active == 0) 1 else 2
+                (active + delta).coerceAtMost(images.lastIndex)
+            }
+            else -> (active + 1).coerceAtMost(images.lastIndex)
+        }
+    }
+
+    fun stepBackward() {
+        if (images.isEmpty()) return
+        page = when (mode) {
+            ReaderMode.SPREAD -> {
+                if (spreadCoverAlone && active == 1) 0 else (active - 2).coerceAtLeast(0)
+            }
+            else -> (active - 1).coerceAtLeast(0)
+        }
+    }
 
     val postIndex = remember(visiblePosts, post.id) { visiblePosts.indexOfFirst { it.id == post.id } }
     val prevPost = if (postIndex > 0) visiblePosts[postIndex - 1] else null
@@ -206,7 +267,10 @@ internal fun PostReader(
                 val jumpWorkModifier = ev.isCtrlPressed || ev.isShiftPressed
                 when (ev.key) {
                     Key.Escape -> {
-                        back(); true
+                        if (isFullscreen) { onToggleFullscreen(); true } else { back(); true }
+                    }
+                    Key.F11, Key.F -> {
+                        onToggleFullscreen(); true
                     }
                     Key.PageUp, Key.LeftBracket -> {
                         if (prevPost != null) { onSelectPost(prevPost.id); true } else false
@@ -217,8 +281,9 @@ internal fun PostReader(
                     Key.DirectionLeft -> {
                         when {
                             jumpWorkModifier && prevPost != null -> { onSelectPost(prevPost.id); true }
-                            mode == ReaderMode.SINGLE -> {
-                                if (active > 0) { page = active - 1; true } else true // Never accidentally leave current work!
+                            mode == ReaderMode.SINGLE || mode == ReaderMode.SPREAD -> {
+                                if (rtlMode) stepForward() else stepBackward()
+                                true // Never accidentally leave current work!
                             }
                             else -> false
                         }
@@ -226,8 +291,9 @@ internal fun PostReader(
                     Key.DirectionRight -> {
                         when {
                             jumpWorkModifier && nextPost != null -> { onSelectPost(nextPost.id); true }
-                            mode == ReaderMode.SINGLE -> {
-                                if (active < images.lastIndex) { page = active + 1; true } else true // Stay on last image!
+                            mode == ReaderMode.SINGLE || mode == ReaderMode.SPREAD -> {
+                                if (rtlMode) stepBackward() else stepForward()
+                                true // Stay inside current work!
                             }
                             else -> false
                         }
@@ -237,7 +303,8 @@ internal fun PostReader(
             }
             .focusable(),
     ) {
-        // Reader Top Bar
+        // Reader Top Bar (hidden in immersive fullscreen mode)
+        if (!isFullscreen) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -247,6 +314,15 @@ internal fun PostReader(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             TextButton(onClick = back) { Text("‹ 보관함", color = colors.ink, fontWeight = FontWeight.SemiBold) }
+
+            IconButton(onClick = onToggleFavoritePost, modifier = Modifier.size(30.dp)) {
+                Icon(
+                    if (post.isFavorite) Icons.Rounded.Star else Icons.Rounded.StarBorder,
+                    contentDescription = "작품 즐겨찾기",
+                    tint = if (post.isFavorite) Color(0xFFFBBF24) else colors.muted,
+                    modifier = Modifier.size(19.dp),
+                )
+            }
 
             if (visiblePosts.size > 1 && postIndex >= 0) {
                 Row(
@@ -307,6 +383,9 @@ internal fun PostReader(
                 horizontalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 ModeTab("단일", mode == ReaderMode.SINGLE) { mode = ReaderMode.SINGLE }
+                if (allImages.size >= 2) {
+                    ModeTab("양면 2P", mode == ReaderMode.SPREAD) { mode = ReaderMode.SPREAD }
+                }
                 ModeTab("웹툰", mode == ReaderMode.WEBTOON) { mode = ReaderMode.WEBTOON }
                 if (hasComparePair) {
                     ModeTab("1:1 비교", mode == ReaderMode.COMPARE, accentColor = colors.emerald) {
@@ -318,6 +397,13 @@ internal fun PostReader(
                 }
             }
 
+            if (mode == ReaderMode.SINGLE || mode == ReaderMode.SPREAD) {
+                ShelfFilter(if (rtlMode) "우→좌 (일본식)" else "좌→우", rtlMode) { rtlMode = !rtlMode }
+            }
+            if (mode == ReaderMode.SPREAD) {
+                ShelfFilter(if (spreadCoverAlone) "표지 1장 ✓" else "표지 2장", spreadCoverAlone) { spreadCoverAlone = !spreadCoverAlone }
+            }
+
             if (post.sourceUrl.isNotBlank()) {
                 TextButton(onClick = { browse(post.sourceUrl) }) {
                     Icon(Icons.AutoMirrored.Rounded.OpenInNew, null, Modifier.size(15.dp))
@@ -325,20 +411,64 @@ internal fun PostReader(
                     Text("원문 열기")
                 }
             }
-            OutlinedButton(
-                onClick = edit,
-                enabled = enabled && post.assets.isNotEmpty(),
-                shape = RoundedCornerShape(10.dp),
-                border = BorderStroke(1.dp, colors.border),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-            ) {
-                Text("작품으로 묶기", style = MaterialTheme.typography.labelLarge)
+            IconButton(onClick = onToggleFullscreen, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Rounded.Fullscreen, contentDescription = "전체화면 (F11)", tint = colors.muted)
+            }
+            Box {
+                IconButton(onClick = { moreMenuOpen = true }, modifier = Modifier.size(32.dp)) {
+                    Icon(Icons.Rounded.MoreVert, contentDescription = "더보기", tint = colors.ink)
+                }
+                DropdownMenu(
+                    expanded = moreMenuOpen,
+                    onDismissRequest = { moreMenuOpen = false },
+                    containerColor = colors.surface,
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("작품 정보 수정 / 묶기", color = colors.ink) },
+                        onClick = { moreMenuOpen = false; edit() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text(".cbz 만화책 파일로 내보내기", color = colors.ink) },
+                        onClick = { moreMenuOpen = false; onExportCbz() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("깔끔한 폴더로 내보내기", color = colors.ink) },
+                        onClick = { moreMenuOpen = false; onExportFolder() },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("페이지 파일명 순 자동 정렬", color = colors.ink) },
+                        onClick = { moreMenuOpen = false; onSortAssetsNaturally() },
+                    )
+                    HorizontalDivider(color = colors.border)
+                    DropdownMenuItem(
+                        text = { Text("이 작품 통째 삭제", color = MaterialTheme.colorScheme.error) },
+                        onClick = { moreMenuOpen = false; pendingDeleteWholePost = true },
+                    )
+                }
             }
         }
         HorizontalDivider(color = colors.border)
+        }
 
         // Stage Content
         when (mode) {
+            ReaderMode.SPREAD -> {
+                if (images.isEmpty()) {
+                    EmptyReaderMessage("보관된 이미지가 없습니다.")
+                } else {
+                    SpreadImageStage(
+                        images = images,
+                        page = active,
+                        coverAlone = spreadCoverAlone,
+                        rtl = rtlMode,
+                        isFullscreen = isFullscreen,
+                        onExitFullscreen = onToggleFullscreen,
+                        onPrev = ::stepBackward,
+                        onNext = ::stepForward,
+                        onJumpPage = { page = it },
+                    )
+                }
+            }
             ReaderMode.ATTACHMENTS -> {
                 AttachmentsPane(
                     attachments = attachments,
@@ -384,9 +514,18 @@ internal fun PostReader(
                             images = images,
                             page = active,
                             hasComparePair = hasComparePair,
+                            hasBookmarks = bookmarkedImages.isNotEmpty(),
+                            isBookmarked = image.id in post.bookmarkedAssetIds,
+                            isCover = post.coverImage()?.id == image.id,
+                            isFullscreen = isFullscreen,
                             variantFilter = variantFilter,
                             onVariantFilter = { variantFilter = it },
                             onPageChange = { page = it },
+                            onToggleBookmark = { onToggleBookmarkAsset(image) },
+                            onSetCover = { onSetCoverAsset(image) },
+                            onMoveEarlier = { onMoveAsset(image, -1); if (active > 0) page = active - 1 },
+                            onMoveLater = { onMoveAsset(image, 1); if (active < images.lastIndex) page = active + 1 },
+                            onExitFullscreen = onToggleFullscreen,
                             onOpenExternal = { open(image) },
                             onDeleteCurrent = { pendingDelete = image },
                             hasSiblingPosts = prevPost != null || nextPost != null,
@@ -395,6 +534,33 @@ internal fun PostReader(
                 }
             }
         }
+    }
+
+    if (pendingDeleteWholePost) {
+        AlertDialog(
+            onDismissRequest = { pendingDeleteWholePost = false },
+            containerColor = colors.surface,
+            titleContentColor = colors.ink,
+            textContentColor = colors.ink,
+            title = { Text("작품 통째 삭제") },
+            text = {
+                Text(
+                    "‘${post.titleLabel()}’ 작품을 내 보관함에서 삭제할까요?\n(앱 내부 사본만 삭제되며 외부 연결 폴더의 원본 파일은 안전하게 보존됩니다.)",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = colors.muted,
+                )
+            },
+            confirmButton = {
+                Button(
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                    onClick = {
+                        pendingDeleteWholePost = false
+                        onDeleteWholePost()
+                    },
+                ) { Text("작품 삭제") }
+            },
+            dismissButton = { TextButton(onClick = { pendingDeleteWholePost = false }) { Text("취소") } },
+        )
     }
 
     pendingDelete?.let { assetToDelete ->
@@ -464,9 +630,18 @@ private fun ColumnScope.SingleImageStage(
     images: List<LibraryAsset>,
     page: Int,
     hasComparePair: Boolean,
+    hasBookmarks: Boolean,
+    isBookmarked: Boolean,
+    isCover: Boolean,
+    isFullscreen: Boolean,
     variantFilter: VariantFilter,
     onVariantFilter: (VariantFilter) -> Unit,
     onPageChange: (Int) -> Unit,
+    onToggleBookmark: () -> Unit,
+    onSetCover: () -> Unit,
+    onMoveEarlier: () -> Unit,
+    onMoveLater: () -> Unit,
+    onExitFullscreen: () -> Unit,
     onOpenExternal: () -> Unit,
     onDeleteCurrent: () -> Unit,
     hasSiblingPosts: Boolean,
@@ -556,8 +731,27 @@ private fun ColumnScope.SingleImageStage(
             }
         }
 
-        // Top-right quick variant pill if both original and textless exist
-        if (hasComparePair) {
+        // Top-left fullscreen exit chip
+        if (isFullscreen) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(14.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(Color(0xCC11141C))
+                    .border(1.dp, Color(0x33FFFFFF), RoundedCornerShape(20.dp))
+                    .clickable(onClick = onExitFullscreen)
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Icon(Icons.Rounded.FullscreenExit, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                Text("전체화면 종료 (F11) · ${page + 1}/${images.size}", fontSize = 11.5.sp, color = Color.White, fontWeight = FontWeight.SemiBold)
+            }
+        }
+
+        // Top-right quick variant pill if both original and textless or bookmarks exist
+        if (hasComparePair || hasBookmarks) {
             Row(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
@@ -589,8 +783,8 @@ private fun ColumnScope.SingleImageStage(
         }
     }
 
-    // Thumbnail Filmstrip
-    if (images.size > 1) {
+    // Thumbnail Filmstrip (hidden in fullscreen)
+    if (!isFullscreen && images.size > 1) {
         LazyRow(
             modifier = Modifier
                 .fillMaxWidth()
@@ -640,6 +834,7 @@ private fun ColumnScope.SingleImageStage(
         }
     }
 
+    if (isFullscreen) return
     HorizontalDivider(color = colors.border)
 
     // Bottom Control Bar
@@ -652,7 +847,7 @@ private fun ColumnScope.SingleImageStage(
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
         ) {
             TextButton(onClick = { onPageChange(page - 1) }, enabled = page > 0) { Text("이전") }
             Text(
@@ -663,13 +858,24 @@ private fun ColumnScope.SingleImageStage(
             )
             TextButton(onClick = { onPageChange(page + 1) }, enabled = page + 1 < images.size) { Text("다음") }
 
-            if (hasSiblingPosts) {
-                Text(
-                    "← → 페이지 이동 · Ctrl+←→ / PgUp·PgDn 작품 전환",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = colors.muted,
-                    modifier = Modifier.padding(start = 10.dp),
+            IconButton(onClick = onToggleBookmark, modifier = Modifier.size(30.dp)) {
+                Icon(
+                    if (isBookmarked) Icons.Rounded.Bookmark else Icons.Rounded.BookmarkBorder,
+                    contentDescription = "페이지 북마크",
+                    tint = if (isBookmarked) colors.accent else colors.muted,
+                    modifier = Modifier.size(18.dp),
                 )
+            }
+            TextButton(onClick = onSetCover) {
+                Text(if (isCover) "표지 ✓" else "표지 지정", color = if (isCover) colors.emerald else colors.muted, fontSize = 11.5.sp)
+            }
+            if (images.size > 1) {
+                TextButton(onClick = onMoveEarlier, enabled = page > 0, contentPadding = PaddingValues(horizontal = 6.dp)) {
+                    Text("◀순서", fontSize = 11.sp)
+                }
+                TextButton(onClick = onMoveLater, enabled = page < images.lastIndex, contentPadding = PaddingValues(horizontal = 6.dp)) {
+                    Text("순서▶", fontSize = 11.sp)
+                }
             }
 
             Spacer(Modifier.weight(1f))
@@ -703,6 +909,125 @@ private fun ColumnScope.SingleImageStage(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.padding(start = 10.dp, bottom = 4.dp),
         )
+    }
+}
+
+@Composable
+private fun ColumnScope.SpreadImageStage(
+    images: List<LibraryAsset>,
+    page: Int,
+    coverAlone: Boolean,
+    rtl: Boolean,
+    isFullscreen: Boolean,
+    onExitFullscreen: () -> Unit,
+    onPrev: () -> Unit,
+    onNext: () -> Unit,
+    onJumpPage: (Int) -> Unit,
+) {
+    val colors = LocalGalleryColors.current
+    val singleCover = coverAlone && page == 0
+    val first = images[page]
+    val second = if (singleCover) null else images.getOrNull(page + 1)
+
+    // In Japanese RTL manga mode, first page (N) is on the RIGHT and second page (N+1) is on the LEFT!
+    val leftPage = if (rtl && second != null) second else first
+    val rightPage = if (rtl && second != null) first else second
+
+    val leftPreview = loadImage(File(leftPage.path), leftPage.sha256, 2400)
+    val rightPreview = rightPage?.let { loadImage(File(it.path), it.sha256, 2400) }
+
+    Box(
+        modifier = Modifier
+            .weight(1f)
+            .fillMaxWidth()
+            .background(colors.cinemaBg),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (singleCover || rightPage == null) {
+            if (leftPreview.bitmap != null) {
+                Image(
+                    bitmap = leftPreview.bitmap,
+                    contentDescription = leftPage.name,
+                    modifier = Modifier.fillMaxSize().padding(12.dp),
+                    contentScale = ContentScale.Fit,
+                )
+            } else {
+                CircularProgressIndicator(color = colors.accent)
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.CenterEnd) {
+                    if (leftPreview.bitmap != null) {
+                        Image(
+                            bitmap = leftPreview.bitmap,
+                            contentDescription = leftPage.name,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Fit,
+                            alignment = Alignment.CenterEnd,
+                        )
+                    } else CircularProgressIndicator(color = colors.accent)
+                }
+                Spacer(Modifier.width(4.dp))
+                Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.CenterStart) {
+                    if (rightPreview?.bitmap != null) {
+                        Image(
+                            bitmap = rightPreview.bitmap,
+                            contentDescription = rightPage.name,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Fit,
+                            alignment = Alignment.CenterStart,
+                        )
+                    } else CircularProgressIndicator(color = colors.accent)
+                }
+            }
+        }
+
+        if (isFullscreen) {
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(14.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(Color(0xCC11141C))
+                    .clickable(onClick = onExitFullscreen)
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Icon(Icons.Rounded.FullscreenExit, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                Text("전체화면 종료 (F11)", fontSize = 11.5.sp, color = Color.White)
+            }
+        }
+    }
+
+    if (!isFullscreen) {
+        HorizontalDivider(color = colors.border)
+        Row(
+            modifier = Modifier.fillMaxWidth().background(colors.sidebar).padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            TextButton(onClick = onPrev, enabled = page > 0) { Text("이전 펼침") }
+            val pageLabel = if (second != null) "${page + 1}–${page + 2} / ${images.size}" else "${page + 1} / ${images.size}"
+            Text(pageLabel, style = MaterialTheme.typography.labelLarge, color = colors.ink)
+            TextButton(
+                onClick = onNext,
+                enabled = if (singleCover) images.size > 1 else page + 2 < images.size,
+            ) { Text("다음 펼침") }
+            Spacer(Modifier.weight(1f))
+            Text(
+                if (rtl) "일본 만화 방향 (오른쪽 → 왼쪽 · ← 키로 다음 페이지)" else "일반 방향 (왼쪽 → 오른쪽 · → 키로 다음 페이지)",
+                style = MaterialTheme.typography.labelSmall,
+                color = colors.muted,
+            )
+            if (page > 0) {
+                TextButton(onClick = { onJumpPage(0) }) { Text("표지로") }
+            }
+        }
     }
 }
 

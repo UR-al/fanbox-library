@@ -61,7 +61,7 @@ internal fun DeviceShareDialog(darkTheme: Boolean, store: LibraryStore, onDismis
                 Column(Modifier.padding(22.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Text("휴대폰과 보관함 연결", style = MaterialTheme.typography.headlineSmall, color = colors.ink)
                     Text(
-                        "같은 Wi-Fi 또는 Tailscale에서 사용할 주소와 공유할 작품을 선택하세요.",
+                        "같은 Wi-Fi(로컬 네트워크)에서 사용할 주소와 공유할 작품을 선택하세요.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = colors.muted,
                     )

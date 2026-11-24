@@ -55,7 +55,7 @@ internal fun PairingScreen(store: LibraryStore, onClose: () -> Unit) {
         }
         val peer = client
         if (peer == null) {
-            Text("PC에서 ‘기기 연결’을 열고 코드를 복사하세요. 같은 Wi-Fi 또는 Tailscale에 연결한 뒤 코드를 입력하세요.")
+            Text("PC에서 ‘기기 연결’을 열고 코드를 복사하세요. PC와 같은 Wi-Fi 네트워크에 연결한 뒤 코드를 입력하세요.")
             OutlinedTextField(code, { code = it }, label = { Text("연결 코드") }, modifier = Modifier.fillMaxWidth())
             Button(enabled = !busy && code.isNotBlank(), onClick = { runTask {
                 val next = PairClient(PairingAddress.parse(code))

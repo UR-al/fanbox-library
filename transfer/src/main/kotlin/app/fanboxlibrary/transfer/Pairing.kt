@@ -31,7 +31,7 @@ class PairingAddress private constructor(
             val octets = parts[1].split('.')
             require(octets.size == 4 && octets.all { it.matches(Regex("[0-9]{1,3}")) && it.toInt() in 0..255 })
             val address = InetAddress.getByAddress(octets.map { it.toInt().toByte() }.toByteArray())
-            require(privateIpv4(address)) { "같은 네트워크 또는 Tailscale 주소를 사용하세요." }
+            require(privateIpv4(address)) { "같은 Wi-Fi 네트워크의 로컬 IP 주소를 사용하세요." }
             val port = parts[2].toInt()
             require(port in 1..65535)
             fun bytes(i: Int): ByteArray {
@@ -45,15 +45,13 @@ class PairingAddress private constructor(
 
 private fun privateIpv4(address: InetAddress): Boolean {
     if (address !is Inet4Address || address.isAnyLocalAddress) return false
-    val bytes = address.address
-    val tailscale = bytes[0].toInt() == 100 && (bytes[1].toInt() and 0xff) in 64..127
-    return address.isLoopbackAddress || address.isSiteLocalAddress || address.isLinkLocalAddress || tailscale
+    return address.isLoopbackAddress || address.isSiteLocalAddress || address.isLinkLocalAddress
 }
 
 fun localAddresses(): List<InetAddress> = NetworkInterface.getNetworkInterfaces().toList()
-    .filter { it.isUp }.flatMap { it.inetAddresses.toList() }
+    .filter { it.isUp && !it.isLoopback }.flatMap { it.inetAddresses.toList() }
     .filter { privateIpv4(it) && !it.isLoopbackAddress }.distinctBy { it.hostAddress }
-    .sortedByDescending { it.hostAddress.startsWith("100.") }
+    .sortedByDescending { it.isSiteLocalAddress }
 
 internal fun PairingAddress.connect(): SSLSocket {
     val trust = object : X509TrustManager {

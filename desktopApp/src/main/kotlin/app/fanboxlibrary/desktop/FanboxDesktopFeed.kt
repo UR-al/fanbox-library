@@ -11,6 +11,7 @@ import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -473,7 +474,52 @@ internal fun DesktopFanboxHub(
     }
 
     /**
-     * One-click batch archival of ALL accessible posts for a supported creator!
+     * Rapidly loads ALL remaining pages for the currently selected creator (2026 back to debut year)
+     * so every year appears in the creator profile grid at once!
+     */
+    fun loadAllCreatorPages() {
+        val cr = selectedCreator ?: return
+        if (feedLoading) return
+        feedLoading = true
+        scope.launch {
+            try {
+                var curFb = fanboxNextUrl
+                var curPt = patreonNextUrl
+                val seen = feedItems.map { it.uniqueKey }.toMutableSet()
+                val acc = feedItems.toMutableList()
+                var guard = 0
+                while (guard++ < 500 && (curFb != null || curPt != null)) {
+                    if (!isActive) break
+                    val res = withContext(Dispatchers.IO) {
+                        if (cr.service == FeedService.PATREON) {
+                            DesktopPatreonClient.fetchCampaignPosts(cr.creatorId, curPt)
+                        } else {
+                            DesktopFanboxClient.fetchCreatorPosts(cr.creatorId, curFb, activeCreatorTag)
+                        }
+                    }
+                    if (res is DesktopFanboxResult.Success) {
+                        val fresh = res.data.items.filter { seen.add(it.uniqueKey) }
+                        if (fresh.isNotEmpty()) {
+                            acc.addAll(fresh)
+                            feedItems = acc.sortedByDescending { it.publishedDatetime }
+                        }
+                        if (cr.service == FeedService.PATREON) {
+                            curPt = if (fresh.isEmpty()) null else res.data.nextUrl
+                        } else {
+                            curFb = if (fresh.isEmpty()) null else res.data.nextUrl
+                        }
+                        fanboxNextUrl = curFb
+                        patreonNextUrl = curPt
+                    } else break
+                }
+            } finally {
+                feedLoading = false
+            }
+        }
+    }
+
+    /**
+     * One-click batch archival of ALL accessible posts for a supported creator across ALL years (2026 ~ debut)!
      */
     fun saveAllCreatorPosts(creator: DesktopFanboxCreator) {
         val activeStore = store ?: return
@@ -483,11 +529,12 @@ internal fun DesktopFanboxHub(
             var totalReused = 0
             var postsDone = 0
             try {
-                savingProgress = "[${creator.name}] 전체 게시물 목록을 수집하는 중…"
+                savingProgress = "[${creator.name}] 전체 연도 게시물 목록을 수집하는 중…"
                 val allPosts = mutableListOf<DesktopFanboxPostSummary>()
+                val seenPostIds = hashSetOf<String>()
                 var nextUrl: String? = null
                 var pageGuard = 0
-                while (pageGuard++ < 40) {
+                while (pageGuard++ < 500) {
                     if (!isActive) throw CancellationException()
                     val res = withContext(Dispatchers.IO) {
                         if (creator.service == FeedService.PATREON) {
@@ -497,9 +544,13 @@ internal fun DesktopFanboxHub(
                         }
                     }
                     if (res is DesktopFanboxResult.Success) {
-                        allPosts.addAll(res.data.items.filterNot { it.isRestricted })
+                        val rawNew = res.data.items.filter { seenPostIds.add(it.id) }
+                        if (rawNew.isEmpty()) break
+                        allPosts.addAll(rawNew.filterNot { it.isRestricted })
                         nextUrl = res.data.nextUrl
-                        savingProgress = "[${creator.name}] 게시물 목록 수집 중… (${allPosts.size}개 발견)"
+                        val oldestYear = allPosts.mapNotNull { it.year }.minOrNull()
+                        val yearNote = if (oldestYear != null) " · ~${oldestYear}년" else ""
+                        savingProgress = "[${creator.name}] 게시물 목록 수집 중… (${allPosts.size}개 발견$yearNote)"
                         if (nextUrl == null) break
                     } else break
                 }
@@ -509,9 +560,11 @@ internal fun DesktopFanboxHub(
                     return@launch
                 }
 
+                val downloadedRewardUrls = hashSetOf<String>()
+
                 for ((pIdx, summary) in allPosts.withIndex()) {
                     if (!isActive) throw CancellationException()
-                    savingProgress = "[${creator.name}] ${pIdx + 1}/${allPosts.size} · ${summary.title} 확인 중…"
+                    savingProgress = "[${creator.name}] ${pIdx + 1}/${allPosts.size} (${summary.displayDate}) · ${summary.title} 확인 중…"
                     val detailRes = withContext(Dispatchers.IO) {
                         if (summary.service == FeedService.PATREON) DesktopPatreonClient.fetchPostDetail(summary.id)
                         else DesktopFanboxClient.fetchPostDetail(summary.id)
@@ -521,13 +574,14 @@ internal fun DesktopFanboxHub(
                         detail.images.forEachIndexed { i, img -> add("%02d_${img.fileName}".format(i + 1) to img.originalUrl) }
                         detail.files.forEach { f -> add(f.fileName to f.url) }
                     }
-                    if (targets.isEmpty()) continue
                     val draft = PostDraft(
                         creator = detail.summary.creatorName,
                         title = detail.summary.title,
                         year = detail.summary.year,
                         sourceUrl = detail.summary.postUrl,
                     )
+
+                    var touchedThisPost = false
                     for ((fIdx, pair) in targets.withIndex()) {
                         if (!isActive) throw CancellationException()
                         val (fileName, url) = pair
@@ -546,11 +600,37 @@ internal fun DesktopFanboxHub(
                         }.onSuccess { rep ->
                             totalAdded += rep.added
                             totalReused += rep.reused
+                            touchedThisPost = true
                         }
                     }
-                    postsDone++
+
+                    // Also resolve & download external Dropbox / Google Drive / gate links if present!
+                    for (extLink in detail.externalLinks) {
+                        if (!isActive) throw CancellationException()
+                        val resolved = ExternalRewardDownloader.resolveRewardLink(extLink) { st ->
+                            savingProgress = "[${creator.name}] ${pIdx + 1}/${allPosts.size} · $st"
+                        }.getOrNull().orEmpty()
+                        val freshRewards = resolved.filter { downloadedRewardUrls.add(it.directDownloadUrl) }
+                        if (freshRewards.isNotEmpty()) {
+                            runCatching {
+                                ExternalRewardDownloader.downloadAndImportRewards(
+                                    store = activeStore,
+                                    draft = draft,
+                                    rewards = freshRewards,
+                                ) { st ->
+                                    savingProgress = "[${creator.name}] ${pIdx + 1}/${allPosts.size} · $st"
+                                }
+                            }.onSuccess { rep ->
+                                totalAdded += rep.added
+                                totalReused += rep.reused
+                                touchedThisPost = true
+                            }
+                        }
+                    }
+
+                    if (touchedThisPost) postsDone++
                 }
-                onLibraryUpdated("[${creator.name}] 일괄 저장 완료 · ${postsDone}작품 · 추가 ${totalAdded}개 · 기존 ${totalReused}개")
+                onLibraryUpdated("[${creator.name}] 전체 연도 일괄 저장 완료 · ${postsDone}작품 · 추가 ${totalAdded}개 · 기존 ${totalReused}개")
             } catch (_: CancellationException) {
                 onLibraryUpdated("[${creator.name}] 일괄 저장 중단됨 · ${postsDone}작품 · 추가 ${totalAdded}개")
             } catch (e: Exception) {
@@ -793,6 +873,7 @@ internal fun DesktopFanboxHub(
                         onEnableAdult = { showAdult = true; fanboxUiPrefs.putBoolean("showAdult", true) },
                         onOpenPost = { activePost = it },
                         onLoadMore = { loadFeed(reset = false) },
+                        onLoadAllPages = ::loadAllCreatorPages,
                         onRetry = { loadFeed(reset = true) },
                         onLogin = { loginModalService = cr.service },
                     )
@@ -1628,11 +1709,17 @@ private fun DesktopCreatorProfilePane(
     onEnableAdult: () -> Unit,
     onOpenPost: (DesktopFanboxPostSummary) -> Unit,
     onLoadMore: () -> Unit,
+    onLoadAllPages: () -> Unit,
     onRetry: () -> Unit,
     onLogin: () -> Unit,
 ) {
     val colors = LocalGalleryColors.current
     val avatar = DesktopFanboxClient.rememberRemoteImage(creator.iconUrl, 128)
+    var selectedYear by remember(creator.creatorId, creator.service) { mutableStateOf<Int?>(null) }
+    val availableYears = remember(posts) { posts.mapNotNull { it.year }.distinct().sortedDescending() }
+    val yearFilteredPosts = remember(posts, selectedYear) {
+        if (selectedYear == null) posts else posts.filter { it.year == selectedYear }
+    }
     Column(Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(
             modifier = Modifier
@@ -1709,12 +1796,27 @@ private fun DesktopCreatorProfilePane(
             }
         }
 
-        // Creator Featured Tags + Hide Text Toggle
+        // Creator Featured Tags + Year Filters + Load All Pages + Hide Text Toggle
         Row(
             Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            ShelfFilter("전체 (${posts.size})", selectedYear == null) { selectedYear = null }
+            availableYears.forEach { yr ->
+                ShelfFilter("${yr}년", selectedYear == yr) { selectedYear = if (selectedYear == yr) null else yr }
+            }
+            if (hasMore) {
+                OutlinedButton(
+                    onClick = onLoadAllPages,
+                    enabled = !loading,
+                    shape = RoundedCornerShape(9.dp),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    modifier = Modifier.height(30.dp),
+                ) {
+                    Text(if (loading) "불러오는 중…" else "전체 연도 끝까지 불러오기", fontSize = 11.5.sp)
+                }
+            }
             ShelfFilter(if (hideTextPosts) "텍스트 숨김 ✓" else "텍스트 글 숨기기", hideTextPosts, onToggleHideText)
             if (tags.isNotEmpty()) {
                 tags.forEach { t ->
@@ -1724,7 +1826,7 @@ private fun DesktopCreatorProfilePane(
         }
 
         DesktopFeedGrid(
-            posts = posts,
+            posts = yearFilteredPosts,
             hiddenAdultCount = hiddenAdultCount,
             loading = loading,
             error = error,
@@ -1765,7 +1867,21 @@ private fun DesktopFeedGrid(
         return
     }
 
+    val gridState = rememberLazyGridState()
+    val shouldAutoLoadMore by remember(gridState, hasMore, loading, posts.size) {
+        derivedStateOf {
+            if (!hasMore || loading || posts.isEmpty()) return@derivedStateOf false
+            val lastVisible = gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            val totalItems = gridState.layoutInfo.totalItemsCount
+            totalItems > 0 && lastVisible >= (totalItems - 6).coerceAtLeast(0)
+        }
+    }
+    LaunchedEffect(shouldAutoLoadMore) {
+        if (shouldAutoLoadMore) onLoadMore()
+    }
+
     LazyVerticalGrid(
+        state = gridState,
         columns = GridCells.Adaptive(245.dp),
         horizontalArrangement = Arrangement.spacedBy(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp),

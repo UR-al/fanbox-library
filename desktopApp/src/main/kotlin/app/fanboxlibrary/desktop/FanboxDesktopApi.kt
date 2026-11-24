@@ -13,6 +13,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -248,12 +249,61 @@ internal object DesktopFanboxClient {
         return requestJson(url, requireAuth = true) { parseFeedPage(it) }
     }
 
-    fun fetchCreatorPosts(creatorId: String, nextUrl: String? = null, tag: String? = null): DesktopFanboxResult<DesktopFanboxFeedPage> {
+    private val creatorPageUrlsCache = ConcurrentHashMap<String, List<String>>()
+
+    private fun fetchCreatorPageUrls(creatorId: String, tag: String? = null): List<String> {
         val encoded = URLEncoder.encode(creatorId, "UTF-8")
         val tagPart = tag?.trim()?.takeIf { it.isNotEmpty() }?.let { "&tag=${URLEncoder.encode(it, "UTF-8")}" }.orEmpty()
-        val url = nextUrl?.takeIf { isAllowedApiUrl(it) }
-            ?: "${DesktopFanboxSession.API_BASE}/post.listCreator?creatorId=$encoded&limit=24$tagPart"
-        return requestJson(url, requireAuth = false) { parseFeedPage(it) }
+        val url = "${DesktopFanboxSession.API_BASE}/post.paginateCreator?creatorId=$encoded$tagPart"
+        val res = requestJson(url, requireAuth = false) { root ->
+            val rawList = when (val b = root["body"]) {
+                is List<*> -> b
+                is Map<*, *> -> (b["pageUrls"] as? List<*>) ?: (b["urls"] as? List<*>) ?: emptyList<Any?>()
+                else -> emptyList<Any?>()
+            }
+            rawList.mapNotNull { (it as? String)?.trim()?.takeIf(::isAllowedApiUrl) }
+        }
+        val urls = (res as? DesktopFanboxResult.Success)?.data.orEmpty()
+        if (urls.isNotEmpty()) {
+            creatorPageUrlsCache["$creatorId|${tag?.trim().orEmpty()}"] = urls
+        }
+        return urls
+    }
+
+    fun fetchCreatorPosts(creatorId: String, nextUrl: String? = null, tag: String? = null): DesktopFanboxResult<DesktopFanboxFeedPage> {
+        val cacheKey = "$creatorId|${tag?.trim().orEmpty()}"
+        val urls = if (nextUrl == null) {
+            fetchCreatorPageUrls(creatorId, tag)
+        } else {
+            creatorPageUrlsCache[cacheKey] ?: fetchCreatorPageUrls(creatorId, tag)
+        }
+
+        if (urls.isEmpty()) {
+            val encoded = URLEncoder.encode(creatorId, "UTF-8")
+            val tagPart = tag?.trim()?.takeIf { it.isNotEmpty() }?.let { "&tag=${URLEncoder.encode(it, "UTF-8")}" }.orEmpty()
+            val fallbackUrl = nextUrl?.takeIf { isAllowedApiUrl(it) }
+                ?: "${DesktopFanboxSession.API_BASE}/post.listCreator?creatorId=$encoded&limit=24$tagPart"
+            return requestJson(fallbackUrl, requireAuth = false) { parseFeedPage(it) }
+        }
+
+        val startIdx = if (nextUrl == null) 0 else urls.indexOf(nextUrl).takeIf { it >= 0 }
+        if (startIdx == null) {
+            val safe = nextUrl?.takeIf { isAllowedApiUrl(it) } ?: return DesktopFanboxResult.Success(DesktopFanboxFeedPage(emptyList(), null))
+            return requestJson(safe, requireAuth = false) { parseFeedPage(it) }
+        }
+
+        // Fetch up to 2 pageUrls chunks (~20 posts) per step for smooth browsing & fast archival!
+        val combined = mutableListOf<DesktopFanboxPostSummary>()
+        val endExclusive = (startIdx + 2).coerceAtMost(urls.size)
+        for (i in startIdx until endExclusive) {
+            when (val r = requestJson(urls[i], requireAuth = false) { parseFeedPage(it) }) {
+                is DesktopFanboxResult.Success -> combined.addAll(r.data.items)
+                is DesktopFanboxResult.AuthRequired -> if (combined.isEmpty()) return r
+                is DesktopFanboxResult.Error -> if (combined.isEmpty()) return r
+            }
+        }
+        val next = urls.getOrNull(endExclusive)
+        return DesktopFanboxResult.Success(DesktopFanboxFeedPage(combined.distinctBy { it.id }, next))
     }
 
     fun fetchRecommendedCreators(): DesktopFanboxResult<List<DesktopFanboxCreator>> {
@@ -634,15 +684,15 @@ internal object DesktopFanboxClient {
         return null
     }
 
-    private fun isAllowedApiUrl(url: String): Boolean {
-        val uri = runCatching { URI(url) }.getOrNull() ?: return false
-        return uri.scheme.equals("https", true) && uri.host.equals("api.fanbox.cc", true)
+    internal fun isAllowedApiUrl(url: String): Boolean {
+        val parsed = url.trim().toHttpUrlOrNull() ?: return false
+        return parsed.isHttps && parsed.host.equals("api.fanbox.cc", true)
     }
 
-    private fun isAllowedMediaUrl(url: String): Boolean {
-        val uri = runCatching { URI(url) }.getOrNull() ?: return false
-        if (!uri.scheme.equals("https", true)) return false
-        val host = uri.host?.lowercase() ?: return false
+    internal fun isAllowedMediaUrl(url: String): Boolean {
+        val parsed = url.trim().toHttpUrlOrNull() ?: return false
+        if (!parsed.isHttps) return false
+        val host = parsed.host.lowercase()
         return host == "fanbox.cc" || host.endsWith(".fanbox.cc") ||
             host == "pximg.net" || host.endsWith(".pximg.net") ||
             host.endsWith(".pixiv.net") ||

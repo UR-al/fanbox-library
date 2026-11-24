@@ -219,5 +219,17 @@ class DesktopLibraryTest {
         val rendered = ExternalRewardDownloader.renderPdfPagesToJpeg(pdfFile, "sample_comic", outDir) {}
         assertEquals(2, rendered.size)
         assertTrue(rendered.all { it.isFile && it.length() > 1000 })
+
+        // 6. Pagination URLs with brackets [campaign_id], [cursor] and FANBOX pageUrls must pass validation
+        assertTrue(
+            DesktopPatreonClient.isAllowedPatreonUrl(
+                "https://www.patreon.com/api/posts?filter[campaign_id]=5269893&fields[post]=title,content&page[cursor]=03%3Aabc",
+            ),
+        )
+        assertTrue(
+            DesktopFanboxClient.isAllowedApiUrl(
+                "https://api.fanbox.cc/post.listCreator?creatorId=kansuke&firstPublishedDatetime=2023-10-05%2011%3A29%3A32&firstId=6000000&sort=newest&limit=10",
+            ),
+        )
     }
 }

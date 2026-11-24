@@ -353,11 +353,54 @@ internal object FanboxClient {
         return requestJson(context, url) { root -> parseFeedPage(root) }
     }
 
-    suspend fun fetchCreatorPosts(context: Context, creatorId: String, nextUrl: String? = null): FanboxResult<FanboxFeedPage> {
+    private val creatorPageUrlsCache = ConcurrentHashMap<String, List<String>>()
+
+    private suspend fun fetchCreatorPageUrls(context: Context, creatorId: String): List<String> {
         val encoded = URLEncoder.encode(creatorId, "UTF-8")
-        val url = nextUrl?.takeIf { isAllowedApiUrl(it) }
-            ?: "${FanboxSession.API_BASE}/post.listCreator?creatorId=$encoded&limit=20"
-        return requestJson(context, url) { root -> parseFeedPage(root) }
+        val res = requestJson(context, "${FanboxSession.API_BASE}/post.paginateCreator?creatorId=$encoded") { root ->
+            val arr = root.optJSONArray("body")
+                ?: root.optJSONObject("body")?.optJSONArray("pageUrls")
+                ?: JSONArray()
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val u = arr.optString(i).trim()
+                    if (isAllowedApiUrl(u)) add(u)
+                }
+            }
+        }
+        val urls = (res as? FanboxResult.Success)?.data.orEmpty()
+        if (urls.isNotEmpty()) creatorPageUrlsCache[creatorId] = urls
+        return urls
+    }
+
+    suspend fun fetchCreatorPosts(context: Context, creatorId: String, nextUrl: String? = null): FanboxResult<FanboxFeedPage> {
+        val urls = if (nextUrl == null) {
+            fetchCreatorPageUrls(context, creatorId)
+        } else {
+            creatorPageUrlsCache[creatorId] ?: fetchCreatorPageUrls(context, creatorId)
+        }
+        if (urls.isEmpty()) {
+            val encoded = URLEncoder.encode(creatorId, "UTF-8")
+            val url = nextUrl?.takeIf { isAllowedApiUrl(it) }
+                ?: "${FanboxSession.API_BASE}/post.listCreator?creatorId=$encoded&limit=20"
+            return requestJson(context, url) { root -> parseFeedPage(root) }
+        }
+        val startIdx = if (nextUrl == null) 0 else urls.indexOf(nextUrl).takeIf { it >= 0 }
+        if (startIdx == null) {
+            val safe = nextUrl?.takeIf { isAllowedApiUrl(it) } ?: return FanboxResult.Success(FanboxFeedPage(emptyList(), null))
+            return requestJson(context, safe) { root -> parseFeedPage(root) }
+        }
+        val combined = mutableListOf<FanboxPostSummary>()
+        val endExclusive = (startIdx + 2).coerceAtMost(urls.size)
+        for (i in startIdx until endExclusive) {
+            when (val r = requestJson(context, urls[i]) { root -> parseFeedPage(root) }) {
+                is FanboxResult.Success -> combined.addAll(r.data.items)
+                is FanboxResult.AuthRequired -> if (combined.isEmpty()) return r
+                is FanboxResult.CloudflareBlocked -> if (combined.isEmpty()) return r
+                is FanboxResult.Error -> if (combined.isEmpty()) return r
+            }
+        }
+        return FanboxResult.Success(FanboxFeedPage(combined.distinctBy { it.id }, urls.getOrNull(endExclusive)))
     }
 
     suspend fun fetchCreatorProfile(context: Context, creatorId: String): FanboxResult<FanboxCreator> {

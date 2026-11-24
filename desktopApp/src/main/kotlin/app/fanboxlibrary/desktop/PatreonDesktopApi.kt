@@ -1,5 +1,6 @@
 package app.fanboxlibrary.desktop
 
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.IOException
@@ -50,16 +51,16 @@ internal object DesktopPatreonClient {
         .build()
 
     fun fetchStream(nextUrl: String? = null): DesktopFanboxResult<DesktopFanboxFeedPage> {
-        val url = nextUrl?.takeIf { isAllowedPatreonUrl(it) }
-            ?: "https://www.patreon.com/api/stream?include=user,campaign,images,attachments&fields[post]=$POST_FIELDS&fields[campaign]=creation_name,avatar_photo_url,url,vanity&fields[user]=full_name,image_url&page[count]=20&json-api-version=1.0"
-        return requestJson(url, requireAuth = true) { parseStreamPage(it) }
+        val baseUrl = "https://www.patreon.com/api/stream?include=user,campaign,images,attachments&fields[post]=$POST_FIELDS&fields[campaign]=creation_name,avatar_photo_url,url,vanity&fields[user]=full_name,image_url&page[count]=25&json-api-version=1.0"
+        val url = nextUrl?.takeIf { isAllowedPatreonUrl(it) } ?: baseUrl
+        return requestJson(url, requireAuth = true) { parseStreamPage(it, baseUrl) }
     }
 
     fun fetchCampaignPosts(campaignId: String, nextUrl: String? = null): DesktopFanboxResult<DesktopFanboxFeedPage> {
         val cid = URLEncoder.encode(campaignId, "UTF-8")
-        val url = nextUrl?.takeIf { isAllowedPatreonUrl(it) }
-            ?: "https://www.patreon.com/api/posts?filter[campaign_id]=$cid&filter[contains_exclusive_posts]=true&sort=-published_at&include=user,campaign,images,attachments&fields[post]=$POST_FIELDS&fields[campaign]=creation_name,avatar_photo_url,url,vanity&fields[user]=full_name,image_url&page[count]=20&json-api-version=1.0"
-        return requestJson(url, requireAuth = false) { parseStreamPage(it) }
+        val baseUrl = "https://www.patreon.com/api/posts?filter[campaign_id]=$cid&filter[contains_exclusive_posts]=true&sort=-published_at&include=user,campaign,images,attachments&fields[post]=$POST_FIELDS&fields[campaign]=creation_name,avatar_photo_url,url,vanity&fields[user]=full_name,image_url&page[count]=30&json-api-version=1.0"
+        val url = nextUrl?.takeIf { isAllowedPatreonUrl(it) } ?: baseUrl
+        return requestJson(url, requireAuth = false) { parseStreamPage(it, baseUrl) }
     }
 
     fun fetchSupportingCreators(): DesktopFanboxResult<List<DesktopFanboxCreator>> {
@@ -475,11 +476,22 @@ internal object DesktopPatreonClient {
         }
     }
 
-    private fun parseStreamPage(root: Map<*, *>): DesktopFanboxFeedPage {
+    private fun parseStreamPage(root: Map<*, *>, baseUrlForCursor: String): DesktopFanboxFeedPage {
         val data = (root["data"] as? List<*>).orEmpty().mapNotNull { it as? Map<*, *> }
         val included = indexIncluded(root["included"] as? List<*>)
         val items = data.mapNotNull { parsePost(it, included) }
-        val next = (root["links"] as? Map<*, *>)?.optStr("next")
+
+        val nextCursor = (((root["meta"] as? Map<*, *>)?.get("pagination") as? Map<*, *>)
+            ?.get("cursors") as? Map<*, *>)?.optStr("next")
+        val linksNext = (root["links"] as? Map<*, *>)?.optStr("next")?.let { raw ->
+            if (raw.startsWith("/")) "https://www.patreon.com$raw" else raw
+        }
+        val next = when {
+            items.isEmpty() -> null
+            !nextCursor.isNullOrBlank() -> "$baseUrlForCursor&page[cursor]=${URLEncoder.encode(nextCursor, "UTF-8")}"
+            !linksNext.isNullOrBlank() && isAllowedPatreonUrl(linksNext) -> linksNext
+            else -> null
+        }
         return DesktopFanboxFeedPage(items, next)
     }
 
@@ -563,10 +575,10 @@ internal object DesktopPatreonClient {
             .replace(Regex("\n{3,}"), "\n\n")
             .trim()
 
-    private fun isAllowedPatreonUrl(url: String): Boolean {
-        val uri = runCatching { URI(url) }.getOrNull() ?: return false
-        if (!uri.scheme.equals("https", true)) return false
-        val host = uri.host?.lowercase() ?: return false
+    internal fun isAllowedPatreonUrl(url: String): Boolean {
+        val parsed = url.trim().toHttpUrlOrNull() ?: return false
+        if (!parsed.isHttps) return false
+        val host = parsed.host.lowercase()
         return host == "patreon.com" || host.endsWith(".patreon.com") ||
             host == "patreonusercontent.com" || host.endsWith(".patreonusercontent.com")
     }

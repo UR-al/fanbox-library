@@ -1,14 +1,40 @@
-name: Build app packages
+name: Build and release app packages
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 jobs:
   packages:
     runs-on: windows-2022
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve release version
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -match '^v(.+)$') {
+            $tag = $env:GITHUB_REF_NAME
+            $ver = $Matches[1]
+            $isRelease = 'true'
+          } else {
+            $props = Get-Content gradle.properties | Where-Object { $_ -match '^appVersion=(.+)$' } | Select-Object -First 1
+            $ver = if ($props -match '^appVersion=(.+)$') { $Matches[1].Trim() } else { '1.0.0' }
+            $tag = "v$ver"
+            $isRelease = 'false'
+          }
+          $parts = ($ver -split '-')[0] -split '\.'
+          $major = if ($parts.Length -ge 1) { [int]$parts[0] } else { 1 }
+          $minor = if ($parts.Length -ge 2) { [int]$parts[1] } else { 0 }
+          $patch = if ($parts.Length -ge 3) { [int]$parts[2] } else { 0 }
+          $code = $major * 10000 + $minor * 100 + $patch
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version_code=$code" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "is_release=$isRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -34,17 +60,55 @@ jobs:
           if ((Get-FileHash $archive).Hash -ne '6AC824E1642D6F7277D0ED7EA09411A508F6116BA6FAE0AA5F2C7DAA2FF43D31') { throw 'WiX checksum mismatch' }
           Expand-Archive $archive $toolsDir
           $toolsDir >> $env:GITHUB_PATH
-      - name: Test and build
+      - name: Test and build packages
         env:
           SKIKO_RENDER_API: SOFTWARE
-        run: .\gradlew.bat :shared:test :transfer:test :desktopApp:test :androidApp:assembleDebug :androidApp:assembleRelease :androidApp:bundleRelease :desktopApp:packageMsi :desktopApp:packageExe
+        run: .\gradlew.bat "-PappVersion=${{ steps.ver.outputs.version }}" "-PappVersionCode=${{ steps.ver.outputs.version_code }}" :shared:test :transfer:test :desktopApp:test :androidApp:assembleDebug :androidApp:assembleRelease :androidApp:bundleRelease :desktopApp:packageMsi :desktopApp:packageExe :desktopApp:createDistributable
+      - name: Collect release files
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.ver.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          $msi = Get-ChildItem desktopApp/build/compose/binaries/main/msi/*.msi | Select-Object -First 1
+          if ($msi) { Copy-Item $msi.FullName "dist/FanboxLibrary-$ver-windows.msi" }
+
+          $exe = Get-ChildItem desktopApp/build/compose/binaries/main/exe/*.exe | Select-Object -First 1
+          if ($exe) { Copy-Item $exe.FullName "dist/FanboxLibrary-$ver-windows.exe" }
+
+          $portableDir = "desktopApp/build/compose/binaries/main/app/FanboxLibrary"
+          if (Test-Path $portableDir) {
+            Compress-Archive -Path $portableDir -DestinationPath "dist/FanboxLibrary-$ver-windows-portable.zip" -Force
+          }
+
+          $debugApk = Get-ChildItem androidApp/build/outputs/apk/debug/*.apk | Select-Object -First 1
+          if ($debugApk) { Copy-Item $debugApk.FullName "dist/fanbox-library-$ver-android-preview.apk" }
+
+          $releaseApk = Get-ChildItem androidApp/build/outputs/apk/release/*.apk | Where-Object { $_.Name -notlike '*unsigned*' } | Select-Object -First 1
+          if ($releaseApk) { Copy-Item $releaseApk.FullName "dist/fanbox-library-$ver-android.apk" }
+
+          $aab = Get-ChildItem androidApp/build/outputs/bundle/release/*.aab | Select-Object -First 1
+          if ($aab) { Copy-Item $aab.FullName "dist/fanbox-library-$ver-google-play.aab" }
+
+          Get-ChildItem dist | Format-Table Name, Length
       - uses: actions/upload-artifact@v4
         with:
-          name: fanbox-library-build
+          name: fanbox-library-${{ steps.ver.outputs.version }}
           if-no-files-found: error
-          path: |
-            androidApp/build/outputs/apk/debug/*.apk
-            androidApp/build/outputs/apk/release/*.apk
-            androidApp/build/outputs/bundle/release/*.aab
-            desktopApp/build/compose/binaries/main/msi/*.msi
-            desktopApp/build/compose/binaries/main/exe/*.exe
+          path: dist/*
+      - name: Publish GitHub Release on tag push
+        if: steps.ver.outputs.is_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $files = (Get-ChildItem dist | Select-Object -ExpandProperty FullName)
+          $exists = $false
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) { $exists = $true }
+          if ($exists) {
+            gh release upload $tag @files --clobber
+          } else {
+            gh release create $tag @files --title "FANBOX Library $tag" --generate-notes
+          }

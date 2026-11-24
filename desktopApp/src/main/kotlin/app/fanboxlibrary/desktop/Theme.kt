@@ -13,7 +13,13 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
-internal const val APP_VERSION = "1.0.0"
+internal val APP_VERSION: String by lazy {
+    GalleryColors::class.java.getResourceAsStream("/app-version.txt")
+        ?.bufferedReader()
+        ?.use { it.readText().trim() }
+        ?.takeIf { it.isNotEmpty() }
+        ?: "1.0.0"
+}
 
 @Immutable
 internal data class GalleryColors(

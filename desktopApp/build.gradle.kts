@@ -8,6 +8,25 @@ plugins {
 
 kotlin { jvmToolchain(17) }
 
+val appVersion = providers.gradleProperty("appVersion").orElse("1.0.0").get()
+val nativePackageVersion = appVersion.substringBefore('-').ifBlank { "1.0.0" }
+
+val generateVersionResource by tasks.registering {
+    val outDir = layout.buildDirectory.dir("generated/version-resources")
+    inputs.property("appVersion", appVersion)
+    outputs.dir(outDir)
+    doLast {
+        val dir = outDir.get().asFile.apply { mkdirs() }
+        dir.resolve("app-version.txt").writeText(appVersion)
+    }
+}
+
+sourceSets {
+    named("main") {
+        resources.srcDir(generateVersionResource)
+    }
+}
+
 dependencies {
     implementation(project(":shared"))
     implementation(project(":transfer"))
@@ -27,7 +46,7 @@ compose.desktop {
         nativeDistributions {
             targetFormats(TargetFormat.Msi, TargetFormat.Exe)
             packageName = "FanboxLibrary"
-            packageVersion = "1.0.0"
+            packageVersion = nativePackageVersion
             description = "Offline library for personally saved FANBOX posts and attachments"
             modules("java.desktop", "jdk.unsupported", "jdk.charsets", "jdk.crypto.ec")
             windows {

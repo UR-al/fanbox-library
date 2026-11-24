@@ -10,6 +10,9 @@ require(signingValues.all { it.isNullOrBlank() } || signingValues.none { it.isNu
     "Provide all four FOLIO upload signing settings, or leave all four unset."
 }
 
+val appVersion = providers.gradleProperty("appVersion").orElse("1.0.0").get()
+val appVersionCode = providers.gradleProperty("appVersionCode").map { it.toInt() }.orElse(1).get()
+
 android {
     namespace = "app.fanboxlibrary.android"
     compileSdk = 36
@@ -20,8 +23,8 @@ android {
         minSdk = 26
         targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = appVersionCode
+        versionName = appVersion
     }
     buildFeatures {
         compose = true

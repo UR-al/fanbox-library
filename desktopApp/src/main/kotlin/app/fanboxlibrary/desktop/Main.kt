@@ -3,6 +3,7 @@ package app.fanboxlibrary.desktop
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -98,6 +99,7 @@ private fun chooseFiles(owner: AwtWindow?, directory: Boolean): List<File> {
 }
 
 private class Notice(val message: String, val warnings: List<String> = emptyList())
+private enum class DesktopSection { FANBOX, LIBRARY }
 
 @Composable
 internal fun LibraryApp(
@@ -108,6 +110,13 @@ internal fun LibraryApp(
 ) {
     val colors = LocalGalleryColors.current
     val scope = rememberCoroutineScope()
+    var activeSection by remember {
+        mutableStateOf(
+            if (owner == null) DesktopSection.LIBRARY
+            else if (prefs.get("lastSection", "FANBOX") == "LIBRARY") DesktopSection.LIBRARY
+            else DesktopSection.FANBOX,
+        )
+    }
     var store by remember { mutableStateOf<LibraryStore?>(null) }
     var posts by remember { mutableStateOf<List<LibraryPost>>(emptyList()) }
     var busy by remember { mutableStateOf("보관함을 여는 중…") }
@@ -297,6 +306,54 @@ internal fun LibraryApp(
                     }
                 }
 
+                Spacer(Modifier.width(10.dp))
+
+                // Top Section Switcher [FANBOX 피드 | 내 보관함]
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(colors.surface)
+                        .border(1.dp, colors.border, RoundedCornerShape(10.dp))
+                        .padding(3.dp),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    val isFanbox = activeSection == DesktopSection.FANBOX
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(7.dp))
+                            .background(if (isFanbox) colors.accent else Color.Transparent)
+                            .clickable {
+                                activeSection = DesktopSection.FANBOX
+                                if (owner != null) prefs.put("lastSection", "FANBOX")
+                            }
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
+                        Text(
+                            "FANBOX 피드",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (isFanbox) Color.White else colors.muted,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(7.dp))
+                            .background(if (!isFanbox) colors.accent else Color.Transparent)
+                            .clickable {
+                                activeSection = DesktopSection.LIBRARY
+                                if (owner != null) prefs.put("lastSection", "LIBRARY")
+                            }
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
+                        Text(
+                            "내 보관함 (${posts.size})",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (!isFanbox) Color.White else colors.muted,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                }
+
                 Spacer(Modifier.weight(1f))
 
                 // GitHub Update Check Button
@@ -429,6 +486,24 @@ internal fun LibraryApp(
                     Text(startupError, color = MaterialTheme.colorScheme.error)
                     Button(onClick = { attempt++ }) { Text("다시 열기") }
                 }
+
+                activeSection == DesktopSection.FANBOX -> DesktopFanboxHub(
+                    store = store,
+                    libraryPosts = posts,
+                    onLibraryUpdated = { msg ->
+                        notice = Notice(msg)
+                        store?.let { activeStore ->
+                            scope.launch {
+                                posts = withContext(Dispatchers.IO) { activeStore.posts() }
+                            }
+                        }
+                    },
+                    onOpenArchivedPost = { localId ->
+                        selected = localId
+                        activeSection = DesktopSection.LIBRARY
+                        if (owner != null) prefs.put("lastSection", "LIBRARY")
+                    },
+                )
 
                 currentPost == null -> Shelf(
                     posts = posts,

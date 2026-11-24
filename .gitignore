@@ -7,3 +7,9 @@ local.properties
 *.keystore
 captures/
 releases/
+dist/
+*.msi
+*.exe
+*.apk
+*.aab
+*.lnk

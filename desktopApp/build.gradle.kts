@@ -30,6 +30,7 @@ sourceSets {
 dependencies {
     implementation(project(":shared"))
     implementation(project(":transfer"))
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okhttp3:okhttp-tls:4.12.0")
     implementation(compose.desktop.currentOs)
     implementation(compose.material3)

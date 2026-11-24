@@ -50,7 +50,7 @@ compose.desktop {
             packageName = "FanboxLibrary"
             packageVersion = nativePackageVersion
             description = "Offline library for personally saved FANBOX posts and attachments"
-            modules("java.desktop", "java.logging", "java.xml", "jdk.unsupported", "jdk.charsets", "jdk.crypto.ec")
+            modules("java.desktop", "java.logging", "java.prefs", "java.xml", "jdk.unsupported", "jdk.charsets", "jdk.crypto.ec")
             windows {
                 perUserInstall = true
                 menu = true

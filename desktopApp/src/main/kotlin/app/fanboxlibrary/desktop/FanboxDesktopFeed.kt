@@ -43,6 +43,7 @@ import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material.icons.rounded.Tag
+import androidx.compose.material.icons.rounded.Translate
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -2112,6 +2113,11 @@ private fun DesktopFanboxPostDetailPane(
     var error by remember(summary.uniqueKey) { mutableStateOf<DesktopFanboxResult<Nothing>?>(null) }
     var lightboxIdx by remember(summary.uniqueKey) { mutableStateOf<Int?>(null) }
     var reloadKey by remember(summary.uniqueKey) { mutableIntStateOf(0) }
+    val postTranslateScope = rememberCoroutineScope()
+    var translatedBody by remember(summary.uniqueKey) { mutableStateOf<String?>(null) }
+    var translatingBody by remember(summary.uniqueKey) { mutableStateOf(false) }
+    var translateBodyStatus by remember(summary.uniqueKey) { mutableStateOf("") }
+    var showOriginalBody by remember(summary.uniqueKey) { mutableStateOf(false) }
 
     val focus = remember { FocusRequester() }
     LaunchedEffect(summary.uniqueKey, reloadKey) {
@@ -2295,21 +2301,95 @@ private fun DesktopFanboxPostDetailPane(
                                 )
                             }
                             if (activeDetail.text.isNotBlank()) {
-                                SelectionContainer {
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .background(colors.surface)
-                                            .border(1.dp, colors.border, RoundedCornerShape(12.dp))
-                                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(colors.surface)
+                                        .border(1.dp, colors.border, RoundedCornerShape(12.dp))
+                                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                                     ) {
-                                        Text(
-                                            activeDetail.text,
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            lineHeight = 22.sp,
-                                            color = colors.ink,
-                                        )
+                                        OutlinedButton(
+                                            onClick = {
+                                                if (translatedBody != null) {
+                                                    showOriginalBody = !showOriginalBody
+                                                } else if (!translatingBody) {
+                                                    translatingBody = true
+                                                    translateBodyStatus = "로컬 번역 준비 중…"
+                                                    postTranslateScope.launch {
+                                                        try {
+                                                            translatedBody = LocalComicTranslator.translatePostText(
+                                                                text = activeDetail.text,
+                                                                onStatus = { translateBodyStatus = it },
+                                                            )
+                                                            showOriginalBody = false
+                                                            translateBodyStatus = ""
+                                                        } catch (ce: CancellationException) {
+                                                            throw ce
+                                                        } catch (e: Exception) {
+                                                            translateBodyStatus = "번역 실패: ${e.message ?: "오류"}"
+                                                        } finally {
+                                                            translatingBody = false
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            enabled = !translatingBody,
+                                            shape = RoundedCornerShape(9.dp),
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                        ) {
+                                            Icon(Icons.Rounded.Translate, null, Modifier.size(14.dp))
+                                            Spacer(Modifier.width(5.dp))
+                                            Text(
+                                                when {
+                                                    translatingBody -> "로컬 번역 중…"
+                                                    translatedBody != null && !showOriginalBody -> "원문 함께 보기"
+                                                    translatedBody != null && showOriginalBody -> "한국어 번역만 보기"
+                                                    else -> "본문 로컬 한국어 번역 (무검열)"
+                                                },
+                                                fontSize = 11.5.sp,
+                                            )
+                                        }
+                                        if (translateBodyStatus.isNotBlank()) {
+                                            if (translatingBody) {
+                                                CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = colors.accent)
+                                            }
+                                            Text(translateBodyStatus, style = MaterialTheme.typography.labelSmall, color = colors.muted)
+                                        }
+                                    }
+                                    SelectionContainer {
+                                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                            if (translatedBody != null) {
+                                                Text(
+                                                    translatedBody!!,
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    lineHeight = 22.sp,
+                                                    color = colors.ink,
+                                                )
+                                                if (showOriginalBody) {
+                                                    HorizontalDivider(color = colors.border)
+                                                    Text(
+                                                        activeDetail.text,
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        lineHeight = 20.sp,
+                                                        color = colors.muted,
+                                                    )
+                                                }
+                                            } else {
+                                                Text(
+                                                    activeDetail.text,
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    lineHeight = 22.sp,
+                                                    color = colors.ink,
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }

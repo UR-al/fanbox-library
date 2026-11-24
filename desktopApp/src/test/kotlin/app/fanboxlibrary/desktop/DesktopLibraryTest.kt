@@ -232,4 +232,29 @@ class DesktopLibraryTest {
             ),
         )
     }
+
+    @Test fun localComicTranslatorBubbleParsingHandlesJsonAndThinkTags() {
+        val raw = """
+            <think>analyzing manga speech bubbles...</think>
+            ```json
+            [
+              {"box_2d": [107, 85, 893, 254], "original": "先輩、こんな遅くまで何してるんですか？", "korean": "선배, 이렇게 늦게까지 뭐 하고 있는 거예요?"},
+              {"box_2d": [869, 674, 130, 517], "original": "Don't tell anyone about tonight!", "korean": "오늘 밤 일은 아무에게도 말하지 마!"}
+            ]
+            ```
+        """.trimIndent()
+        val res = LocalComicTranslator.parseBubbleResponse(raw, TranslatorModelPreset.QWEN3_VL_4B.id)
+        assertEquals(TranslatorModelPreset.QWEN3_VL_4B.id, res.presetId)
+        assertEquals(2, res.bubbles.size)
+        assertTrue(res.bubbles[0].hasValidBox)
+        assertEquals(107f, res.bubbles[0].xmin, 0.01f)
+        assertEquals(254f, res.bubbles[0].ymax, 0.01f)
+        assertEquals("선배, 이렇게 늦게까지 뭐 하고 있는 거예요?", res.bubbles[0].korean)
+        // Reversed coordinates should be normalized to min..max
+        assertEquals(130f, res.bubbles[1].xmin, 0.01f)
+        assertEquals(869f, res.bubbles[1].xmax, 0.01f)
+        assertEquals(517f, res.bubbles[1].ymin, 0.01f)
+        assertEquals(674f, res.bubbles[1].ymax, 0.01f)
+        assertTrue(res.bubbles[1].hasValidBox)
+    }
 }

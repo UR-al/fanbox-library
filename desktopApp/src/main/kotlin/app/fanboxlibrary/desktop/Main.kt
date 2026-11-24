@@ -118,6 +118,8 @@ internal fun LibraryApp(
     var editing by remember { mutableStateOf<LibraryPost?>(null) }
     var browse by remember { mutableStateOf(false) }
     var deviceShare by remember { mutableStateOf(false) }
+    var activeZipAsset by remember { mutableStateOf<LibraryAsset?>(null) }
+    var activePsdTarget by remember { mutableStateOf<Pair<File, String>?>(null) }
     var showUpdateDialog by remember { mutableStateOf(false) }
     var updateResult by remember { mutableStateOf<UpdateCheckResult?>(null) }
     var lastWebUrl by remember { mutableStateOf("") }
@@ -465,6 +467,8 @@ internal fun LibraryApp(
                                 launchExternal("파일을 저장했습니다. " + dest.name) { exportLibraryFile(asset, dest) }
                             }
                         },
+                        openZip = { asset -> activeZipAsset = asset },
+                        openPsd = { asset -> activePsdTarget = File(asset.path) to asset.name },
                     )
                 }
             }
@@ -501,6 +505,48 @@ internal fun LibraryApp(
     }
 
     if (showWarnings) NoticeDialog(notice?.warnings.orEmpty()) { showWarnings = false }
+    activeZipAsset?.let { zipAsset ->
+        val post = currentPost
+        val activeStore = store
+        if (post != null && activeStore != null) {
+            DesktopZipExplorerDialog(
+                darkTheme = darkTheme,
+                post = post,
+                zipAsset = zipAsset,
+                store = activeStore,
+                onLibraryChanged = { msg ->
+                    notice = Notice(msg)
+                    scope.launch {
+                        posts = withContext(Dispatchers.IO) { activeStore.posts() }
+                    }
+                },
+                onOpenPsd = { file, name ->
+                    activePsdTarget = file to name
+                },
+                onDismiss = { activeZipAsset = null },
+            )
+        }
+    }
+    activePsdTarget?.let { (file, name) ->
+        val post = currentPost
+        val activeStore = store
+        if (post != null && activeStore != null) {
+            DesktopPsdStudioDialog(
+                darkTheme = darkTheme,
+                post = post,
+                psdFile = file,
+                displayName = name,
+                store = activeStore,
+                onLibraryChanged = { msg ->
+                    notice = Notice(msg)
+                    scope.launch {
+                        posts = withContext(Dispatchers.IO) { activeStore.posts() }
+                    }
+                },
+                onDismiss = { activePsdTarget = null },
+            )
+        }
+    }
     if (showUpdateDialog) {
         UpdateDialog(
             currentVersion = APP_VERSION,

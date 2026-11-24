@@ -124,6 +124,8 @@ internal fun PostReader(
     browse: (String) -> Unit,
     open: (LibraryAsset) -> Unit,
     export: (LibraryAsset) -> Unit,
+    openZip: (LibraryAsset) -> Unit = {},
+    openPsd: (LibraryAsset) -> Unit = {},
 ) {
     val colors = LocalGalleryColors.current
     val allImages = remember(post) { post.assets.filter { it.isImage } }
@@ -295,7 +297,13 @@ internal fun PostReader(
         // Stage Content
         when (mode) {
             ReaderMode.ATTACHMENTS -> {
-                AttachmentsPane(attachments = attachments, open = open, export = export)
+                AttachmentsPane(
+                    attachments = attachments,
+                    open = open,
+                    export = export,
+                    openZip = openZip,
+                    openPsd = openPsd,
+                )
             }
             ReaderMode.WEBTOON -> {
                 if (images.isEmpty()) {
@@ -889,6 +897,8 @@ private fun ColumnScope.AttachmentsPane(
     attachments: List<LibraryAsset>,
     open: (LibraryAsset) -> Unit,
     export: (LibraryAsset) -> Unit,
+    openZip: (LibraryAsset) -> Unit,
+    openPsd: (LibraryAsset) -> Unit,
 ) {
     val colors = LocalGalleryColors.current
     if (attachments.isEmpty()) {
@@ -933,6 +943,24 @@ private fun ColumnScope.AttachmentsPane(
                         style = MaterialTheme.typography.bodySmall,
                         color = colors.muted,
                     )
+                }
+                if (ZipExplorer.isZipFile(asset.name)) {
+                    Button(
+                        onClick = { openZip(asset) },
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
+                        Text("ZIP 탐색")
+                    }
+                } else if (ZipExplorer.isPsdFile(asset.name)) {
+                    Button(
+                        onClick = { openPsd(asset) },
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = colors.emerald),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
+                        Text("PSD 레이어 편집")
+                    }
                 }
                 TextButton(onClick = { export(asset) }) {
                     Icon(Icons.Rounded.Download, null, Modifier.size(16.dp))

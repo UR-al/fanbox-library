@@ -69,6 +69,7 @@ import app.fanboxlibrary.shared.LibraryAsset
 import app.fanboxlibrary.shared.LibraryPost
 import app.fanboxlibrary.shared.PostDraft
 import app.fanboxlibrary.shared.UpdateCheckResult
+import app.fanboxlibrary.shared.ZipExplorer
 import coil.compose.AsyncImage
 import java.io.File
 import kotlinx.coroutines.launch
@@ -92,6 +93,8 @@ private enum class MainTab(val label: String) {
     SYNC("기기 연결"),
 }
 
+private data class ActivePsdSession(val file: File, val displayName: String)
+
 @Composable
 internal fun ArchiveApp(model: ArchiveModel) {
     val context = LocalContext.current
@@ -102,6 +105,8 @@ internal fun ArchiveApp(model: ArchiveModel) {
     val activeTab = runCatching { MainTab.valueOf(activeTabName) }.getOrDefault(MainTab.FANBOX)
     var postId by rememberSaveable { mutableStateOf<String?>(null) }
     var readerId by rememberSaveable { mutableStateOf<String?>(null) }
+    var activeZipAssetId by rememberSaveable { mutableStateOf<String?>(null) }
+    var activePsd by remember { mutableStateOf<ActivePsdSession?>(null) }
     var fanboxFullscreen by remember { mutableStateOf(false) }
     var showUpdateDialog by rememberSaveable { mutableStateOf(false) }
     var updateResult by remember { mutableStateOf<UpdateCheckResult?>(null) }
@@ -157,6 +162,8 @@ internal fun ArchiveApp(model: ArchiveModel) {
     fun back() {
         when {
             model.importing -> model.cancelImport()
+            activePsd != null -> activePsd = null
+            activeZipAssetId != null -> activeZipAssetId = null
             readerId != null -> readerId = null
             activeTab == MainTab.LIBRARY && postId != null -> postId = null
             activeTab == MainTab.SYNC -> {
@@ -167,11 +174,11 @@ internal fun ArchiveApp(model: ArchiveModel) {
         }
     }
 
-    BackHandler(enabled = model.importing || readerId != null || postId != null || activeTab != MainTab.FANBOX) {
+    BackHandler(enabled = model.importing || activePsd != null || activeZipAssetId != null || readerId != null || postId != null || activeTab != MainTab.FANBOX) {
         back()
     }
 
-    val showBottomBar = !model.importing && readerId == null && !fanboxFullscreen
+    val showBottomBar = !model.importing && readerId == null && activeZipAssetId == null && activePsd == null && !fanboxFullscreen
 
     FanboxAndroidTheme(darkTheme = darkTheme) {
         val colors = LocalAndroidGalleryColors.current
@@ -243,6 +250,27 @@ internal fun ArchiveApp(model: ArchiveModel) {
             Box(Modifier.fillMaxSize().padding(padding)) {
                 when {
                     model.importing -> ImportView(model, pick = { picker.launch(arrayOf("*/*")) }, back = ::back)
+                    post != null && activePsd != null -> PsdLayerStudioScreen(
+                        post = post,
+                        psdFile = activePsd!!.file,
+                        displayName = activePsd!!.displayName,
+                        model = model,
+                        onBack = { activePsd = null },
+                    )
+                    post != null && activeZipAssetId != null -> {
+                        val zipAsset = post.assets.find { it.id == activeZipAssetId }
+                        if (zipAsset == null) {
+                            LaunchedEffect(Unit) { activeZipAssetId = null }
+                        } else {
+                            ZipExplorerScreen(
+                                post = post,
+                                zipAsset = zipAsset,
+                                model = model,
+                                onOpenPsdFile = { file, name, _ -> activePsd = ActivePsdSession(file, name) },
+                                onBack = { activeZipAssetId = null },
+                            )
+                        }
+                    }
                     post != null && readerId != null -> ReaderView(
                         post = post,
                         visiblePosts = visiblePosts.ifEmpty { model.posts },
@@ -278,6 +306,8 @@ internal fun ArchiveApp(model: ArchiveModel) {
                         onSelectPost = { postId = it },
                         back = { postId = null },
                         read = { readerId = it },
+                        openZip = { activeZipAssetId = it.id },
+                        openPsd = { asset -> activePsd = ActivePsdSession(File(asset.path), asset.name) },
                         add = { model.beginImport(post.asDraft()) },
                         move = { selected -> model.beginImport(sourceId = post.id, selected = selected) },
                         error = { model.notice = it },
@@ -857,6 +887,8 @@ private fun PostView(
     onSelectPost: (String) -> Unit,
     back: () -> Unit,
     read: (String) -> Unit,
+    openZip: (LibraryAsset) -> Unit,
+    openPsd: (LibraryAsset) -> Unit,
     add: () -> Unit,
     move: (Set<String>) -> Unit,
     error: (String) -> Unit,
@@ -948,6 +980,8 @@ private fun PostView(
                 },
                 back = back,
                 read = read,
+                openZip = openZip,
+                openPsd = openPsd,
                 add = add,
                 move = move,
                 error = error,
@@ -1001,6 +1035,8 @@ private fun PostDetailBody(
     onNext: () -> Unit,
     back: () -> Unit,
     read: (String) -> Unit,
+    openZip: (LibraryAsset) -> Unit,
+    openPsd: (LibraryAsset) -> Unit,
     add: () -> Unit,
     move: (Set<String>) -> Unit,
     error: (String) -> Unit,
@@ -1193,7 +1229,12 @@ private fun PostDetailBody(
                     selecting = selecting,
                     checked = asset.id in selected,
                     onClick = {
-                        if (selecting) toggle(asset.id) else openAttachment(context, asset, error)
+                        when {
+                            selecting -> toggle(asset.id)
+                            ZipExplorer.isZipFile(asset.name) -> openZip(asset)
+                            ZipExplorer.isPsdFile(asset.name) -> openPsd(asset)
+                            else -> openAttachment(context, asset, error)
+                        }
                     },
                 )
             }
@@ -1296,6 +1337,10 @@ private fun AttachmentRowCard(
                 style = MaterialTheme.typography.labelSmall,
                 color = colors.muted,
             )
+        }
+        when {
+            ZipExplorer.isZipFile(asset.name) -> MobileBadge("ZIP 탐색", colors.secondary)
+            ZipExplorer.isPsdFile(asset.name) -> MobileBadge("PSD 편집", colors.emerald)
         }
     }
 }

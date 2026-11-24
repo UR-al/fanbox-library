@@ -244,11 +244,14 @@ internal class ArchiveModel(application: Application) : AndroidViewModel(applica
                 for ((idx, pair) in targets.withIndex()) {
                     val (fileName, url) = pair
                     savingProgress = "보관함에 저장 중 (${idx + 1}/${targets.size}) · $fileName"
+                    val stream = withContext(Dispatchers.IO) {
+                        FanboxClient.downloadToInputStream(context, url)
+                    }
                     val report = withContext(Dispatchers.IO) {
-                        val source = ImportSource(fileName, "원본/$fileName") {
-                            FanboxClient.openDownloadStream(context, url)
+                        stream.use { input ->
+                            val source = ImportSource(fileName, "원본/$fileName") { input }
+                            store.importManaged(draft, listOf(source))
                         }
-                        store.importManaged(draft, listOf(source))
                     }
                     added += report.added
                     reused += report.reused
@@ -284,15 +287,18 @@ internal class ArchiveModel(application: Application) : AndroidViewModel(applica
         savingProgress = "다운로드 저장 중 · $cleanName"
         viewModelScope.launch {
             try {
+                val stream = withContext(Dispatchers.IO) {
+                    FanboxClient.downloadToInputStream(context, url)
+                }
                 val (report, updated) = withContext(Dispatchers.IO) {
                     val draft = PostDraft(
                         title = pageTitle.removeSuffix("｜pixivFANBOX").removeSuffix(" - pixivFANBOX").trim(),
                         sourceUrl = canonicalPostUrl,
                     )
-                    val source = ImportSource(cleanName, "원본/$cleanName") {
-                        FanboxClient.openDownloadStream(context, url)
+                    stream.use { input ->
+                        val source = ImportSource(cleanName, "원본/$cleanName") { input }
+                        store.importManaged(draft, listOf(source)) to store.posts()
                     }
-                    store.importManaged(draft, listOf(source)) to store.posts()
                 }
                 posts = updated
                 notice = "보관함에 저장했습니다 · $cleanName (${report.summary()})"

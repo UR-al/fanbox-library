@@ -34,14 +34,19 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.ArrowForward
 import androidx.compose.material.icons.automirrored.rounded.Login
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.CardMembership
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.ChevronRight
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DarkMode
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Favorite
@@ -50,7 +55,9 @@ import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.Language
 import androidx.compose.material.icons.rounded.LightMode
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.PersonAdd
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.SystemUpdateAlt
 import androidx.compose.material.icons.rounded.ViewAgenda
@@ -59,6 +66,7 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
@@ -70,6 +78,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -77,16 +86,21 @@ import androidx.compose.ui.viewinterop.AndroidView
 import app.fanboxlibrary.shared.FanboxLinks
 import coil.compose.AsyncImage
 import coil.compose.SubcomposeAsyncImage
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
-private enum class FanboxViewMode { FEED, WEB }
 private enum class FeedCategory(val label: String) {
     HOME("홈 피드"),
     SUPPORTING("후원중"),
     CREATORS("작가 목록"),
+    SEARCH("작가 찾기"),
 }
+
+private data class WebModalRequest(
+    val url: String,
+    val title: String,
+    val autoCloseOnLogin: Boolean = false,
+)
 
 @Composable
 internal fun FanboxHubScreen(
@@ -102,15 +116,15 @@ internal fun FanboxHubScreen(
     val prefs = remember(context) { context.getSharedPreferences("fanbox_ui_prefs", Context.MODE_PRIVATE) }
     val scope = rememberCoroutineScope()
 
-    var viewModeName by rememberSaveable { mutableStateOf(FanboxViewMode.FEED.name) }
-    val viewMode = runCatching { FanboxViewMode.valueOf(viewModeName) }.getOrDefault(FanboxViewMode.FEED)
     var categoryName by rememberSaveable { mutableStateOf(FeedCategory.HOME.name) }
     val category = runCatching { FeedCategory.valueOf(categoryName) }.getOrDefault(FeedCategory.HOME)
 
     var showAdult by rememberSaveable { mutableStateOf(prefs.getBoolean("show_adult", false)) }
     var gridMode by rememberSaveable { mutableStateOf(prefs.getBoolean("feed_grid_mode", false)) }
-    var webUrl by rememberSaveable { mutableStateOf(FANBOX_HOME) }
     var loggedIn by remember { mutableStateOf(FanboxSession.hasLoginCookie()) }
+
+    // Explicit WebView modal (ONLY opened when user taps Login, Subscribe/Plan, or explicit Web button)
+    var webModal by remember { mutableStateOf<WebModalRequest?>(null) }
 
     // Feed state
     var feedItems by remember { mutableStateOf<List<FanboxPostSummary>>(emptyList()) }
@@ -118,11 +132,20 @@ internal fun FanboxHubScreen(
     var feedLoading by remember { mutableStateOf(false) }
     var feedError by remember { mutableStateOf<FanboxResult<Nothing>?>(null) }
 
-    // Creators state
+    // Creators & selected creator profile/plans state
     var creators by remember { mutableStateOf<List<FanboxCreator>>(emptyList()) }
     var selectedCreator by remember { mutableStateOf<FanboxCreator?>(null) }
+    var creatorPlans by remember { mutableStateOf<List<FanboxPlan>>(emptyList()) }
     var creatorsLoading by remember { mutableStateOf(false) }
     var creatorsError by remember { mutableStateOf<FanboxResult<Nothing>?>(null) }
+    var followBusyId by remember { mutableStateOf<String?>(null) }
+
+    // Creator search state
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var searchResults by remember { mutableStateOf<List<FanboxCreator>>(emptyList()) }
+    var searchLoading by remember { mutableStateOf(false) }
+    var searchError by remember { mutableStateOf<FanboxResult<Nothing>?>(null) }
+    var hasSearched by remember { mutableStateOf(false) }
 
     // Detail & online lightbox state
     var activePostId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -137,8 +160,8 @@ internal fun FanboxHubScreen(
         }
     }
 
-    LaunchedEffect(activePostId, lightboxImages.isNotEmpty()) {
-        onFullscreenChanged(lightboxImages.isNotEmpty())
+    LaunchedEffect(lightboxImages.isNotEmpty(), webModal != null) {
+        onFullscreenChanged(lightboxImages.isNotEmpty() || webModal != null)
     }
 
     fun loadFeed(reset: Boolean = true) {
@@ -149,13 +172,11 @@ internal fun FanboxHubScreen(
         if (reset) feedError = null
         scope.launch {
             loggedIn = FanboxSession.hasLoginCookie()
-            val result = withContext(Dispatchers.IO) {
-                val creator = selectedCreator
-                when {
-                    creator != null -> FanboxClient.fetchCreatorPosts(context, creator.creatorId, next)
-                    category == FeedCategory.SUPPORTING -> FanboxClient.fetchSupportingFeed(context, next)
-                    else -> FanboxClient.fetchHomeFeed(context, next)
-                }
+            val creator = selectedCreator
+            val result = when {
+                creator != null -> FanboxClient.fetchCreatorPosts(context, creator.creatorId, next)
+                category == FeedCategory.SUPPORTING -> FanboxClient.fetchSupportingFeed(context, next)
+                else -> FanboxClient.fetchHomeFeed(context, next)
             }
             when (result) {
                 is FanboxResult.Success -> {
@@ -164,7 +185,7 @@ internal fun FanboxHubScreen(
                     feedError = null
                 }
                 is FanboxResult.AuthRequired -> {
-                    loggedIn = false
+                    loggedIn = FanboxSession.hasLoginCookie()
                     feedError = result
                 }
                 is FanboxResult.CloudflareBlocked -> feedError = result
@@ -180,14 +201,14 @@ internal fun FanboxHubScreen(
         creatorsError = null
         scope.launch {
             loggedIn = FanboxSession.hasLoginCookie()
-            val result = withContext(Dispatchers.IO) { FanboxClient.fetchCreators(context) }
+            val result = FanboxClient.fetchCreators(context)
             when (result) {
                 is FanboxResult.Success -> {
                     creators = result.data
                     creatorsError = null
                 }
                 is FanboxResult.AuthRequired -> {
-                    loggedIn = false
+                    loggedIn = FanboxSession.hasLoginCookie()
                     creatorsError = result
                 }
                 is FanboxResult.CloudflareBlocked -> creatorsError = result
@@ -197,108 +218,184 @@ internal fun FanboxHubScreen(
         }
     }
 
-    LaunchedEffect(viewMode, category, selectedCreator?.creatorId) {
-        if (viewMode == FanboxViewMode.FEED) {
-            loggedIn = FanboxSession.hasLoginCookie()
-            if (loggedIn) {
-                if (category == FeedCategory.CREATORS && selectedCreator == null) {
-                    if (creators.isEmpty()) loadCreators()
-                } else {
-                    loadFeed(reset = true)
+    fun runCreatorSearch() {
+        val q = searchQuery.trim()
+        if (q.isEmpty() || searchLoading) return
+        searchLoading = true
+        searchError = null
+        hasSearched = true
+        scope.launch {
+            val result = FanboxClient.searchCreators(context, q)
+            when (result) {
+                is FanboxResult.Success -> {
+                    searchResults = result.data
+                    searchError = null
                 }
+                is FanboxResult.AuthRequired -> searchError = result
+                is FanboxResult.CloudflareBlocked -> searchError = result
+                is FanboxResult.Error -> searchError = result
             }
+            searchLoading = false
         }
     }
 
-    // Lightbox fullscreen online image viewer
-    if (lightboxImages.isNotEmpty()) {
-        BackHandler { lightboxImages = emptyList() }
-        OnlineImageLightbox(
-            images = lightboxImages,
-            initialIndex = lightboxStartIndex,
-            onClose = { lightboxImages = emptyList() },
-        )
-        return
+    fun toggleFollow(target: FanboxCreator) {
+        if (followBusyId != null) return
+        followBusyId = target.creatorId
+        scope.launch {
+            // Ensure we have the numeric userId via creator.get if missing
+            val fullCreator = if (target.userId.isNotBlank()) target else {
+                (FanboxClient.fetchCreatorProfile(context, target.creatorId) as? FanboxResult.Success)?.data ?: target
+            }
+            val desired = !fullCreator.isFollowed
+            when (val res = FanboxClient.setFollowCreator(context, fullCreator.userId, desired)) {
+                is FanboxResult.Success -> {
+                    val updated = fullCreator.copy(isFollowed = desired)
+                    if (selectedCreator?.creatorId == updated.creatorId) selectedCreator = updated
+                    searchResults = searchResults.map { if (it.creatorId == updated.creatorId) updated else it }
+                    creators = creators.map { if (it.creatorId == updated.creatorId) updated else it }
+                    model.notice = if (desired) "${updated.name} 작가를 팔로우했습니다." else "${updated.name} 팔로우를 해제했습니다."
+                }
+                is FanboxResult.AuthRequired -> {
+                    model.notice = "팔로우하려면 FANBOX 로그인이 필요합니다."
+                }
+                is FanboxResult.CloudflareBlocked -> model.notice = res.message
+                is FanboxResult.Error -> model.notice = res.message
+            }
+            followBusyId = null
+        }
     }
 
-    // Native Post Detail View
-    val currentPostId = activePostId
-    if (viewMode == FanboxViewMode.FEED && currentPostId != null) {
-        BackHandler { activePostId = null }
-        val visibleFeed = remember(feedItems, showAdult) {
-            if (showAdult) feedItems else feedItems.filterNot { it.hasAdultContent }
+    // Load full creator profile + plans whenever a creator is selected
+    LaunchedEffect(selectedCreator?.creatorId) {
+        val cr = selectedCreator ?: return@LaunchedEffect
+        creatorPlans = emptyList()
+        val profileRes = FanboxClient.fetchCreatorProfile(context, cr.creatorId)
+        if (profileRes is FanboxResult.Success) {
+            selectedCreator = profileRes.data.copy(
+                isSupporting = profileRes.data.isSupporting || cr.isSupporting,
+                planFee = cr.planFee,
+            )
         }
-        FanboxPostDetailScreen(
-            postId = currentPostId,
-            feedList = visibleFeed,
-            model = model,
-            archivedLocalId = archivedPostIdMap[currentPostId],
-            onSelectPost = { activePostId = it },
-            onSelectCreator = { id, name, icon ->
-                activePostId = null
-                selectedCreator = FanboxCreator(id, name, icon, null, "", isSupporting = false)
-            },
-            onOpenInWeb = { url ->
-                webUrl = url
-                activePostId = null
-                viewModeName = FanboxViewMode.WEB.name
-            },
-            onOpenArchived = onOpenArchivedPost,
-            onOpenLightbox = { imgs, start ->
-                lightboxImages = imgs
-                lightboxStartIndex = start
-            },
-            onBack = { activePostId = null },
-        )
-        return
+        val plansRes = FanboxClient.fetchCreatorPlans(context, cr.creatorId)
+        if (plansRes is FanboxResult.Success) {
+            creatorPlans = plansRes.data
+        }
+    }
+
+    LaunchedEffect(category, selectedCreator?.creatorId, loggedIn) {
+        loggedIn = FanboxSession.hasLoginCookie()
+        when {
+            selectedCreator != null -> loadFeed(reset = true)
+            category == FeedCategory.CREATORS -> if (loggedIn && creators.isEmpty()) loadCreators()
+            category == FeedCategory.SEARCH -> Unit
+            else -> if (loggedIn) loadFeed(reset = true)
+        }
     }
 
     val colors = LocalAndroidGalleryColors.current
-    Column(Modifier.fillMaxSize().background(colors.bg)) {
-        // Unified Top Bar
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(32.dp)
-                    .clip(RoundedCornerShape(9.dp))
-                    .background(Brush.linearGradient(listOf(colors.accent, colors.secondary))),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text("F", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 15.sp)
-            }
 
-            // Hybrid Mode Switcher [피드 | 웹뷰]
+    Box(Modifier.fillMaxSize().background(colors.bg)) {
+        // Hidden persistent 1x1 Chromium WebView that powers all api.fanbox.cc requests cleanly
+        AndroidView(
+            modifier = Modifier.size(1.dp).alpha(0f),
+            factory = { ctx -> FanboxWebBridge.attachOrCreate(ctx) },
+        )
+
+        // Fullscreen Online Image Lightbox
+        if (lightboxImages.isNotEmpty()) {
+            BackHandler { lightboxImages = emptyList() }
+            OnlineImageLightbox(
+                images = lightboxImages,
+                initialIndex = lightboxStartIndex,
+                onClose = { lightboxImages = emptyList() },
+            )
+            return@Box
+        }
+
+        // Explicit WebView Modal (Login / Plan Checkout / Optional Web Browse)
+        val modal = webModal
+        if (modal != null) {
+            BackHandler { webModal = null }
+            FanboxWebModalScreen(
+                request = modal,
+                model = model,
+                onClose = { didLogin ->
+                    webModal = null
+                    if (didLogin) {
+                        loggedIn = FanboxSession.hasLoginCookie()
+                        FanboxWebBridge.reloadOrigin()
+                        scope.launch {
+                            delay(600)
+                            if (selectedCreator != null) loadFeed(reset = true)
+                            else if (category == FeedCategory.CREATORS) loadCreators()
+                            else if (category != FeedCategory.SEARCH) loadFeed(reset = true)
+                        }
+                    }
+                },
+            )
+            return@Box
+        }
+
+        // Native Post Detail Screen
+        val currentPostId = activePostId
+        if (currentPostId != null) {
+            BackHandler { activePostId = null }
+            val visibleFeed = remember(feedItems, showAdult) {
+                if (showAdult) feedItems else feedItems.filterNot { it.hasAdultContent }
+            }
+            FanboxPostDetailScreen(
+                postId = currentPostId,
+                feedList = visibleFeed,
+                model = model,
+                archivedLocalId = archivedPostIdMap[currentPostId],
+                onSelectPost = { activePostId = it },
+                onSelectCreator = { id, name, icon ->
+                    activePostId = null
+                    selectedCreator = FanboxCreator(id, "", name, icon, null, "")
+                },
+                onOpenInWeb = { url ->
+                    webModal = WebModalRequest(url = url, title = "FANBOX 원문")
+                },
+                onOpenArchived = onOpenArchivedPost,
+                onOpenLightbox = { imgs, start ->
+                    lightboxImages = imgs
+                    lightboxStartIndex = start
+                },
+                onBack = { activePostId = null },
+            )
+            return@Box
+        }
+
+        // Main Native FANBOX Hub
+        Column(Modifier.fillMaxSize()) {
+            // Top Header Bar (stays 100% native!)
             Row(
                 modifier = Modifier
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(colors.surface)
-                    .border(1.dp, colors.border, RoundedCornerShape(10.dp))
-                    .padding(3.dp),
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                ModePill("피드", viewMode == FanboxViewMode.FEED) {
-                    viewModeName = FanboxViewMode.FEED.name
-                    loggedIn = FanboxSession.hasLoginCookie()
-                    if (loggedIn) {
-                        if (category == FeedCategory.CREATORS && selectedCreator == null) loadCreators()
-                        else loadFeed(reset = true)
-                    }
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(Brush.linearGradient(listOf(colors.accent, colors.secondary))),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("F", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 15.sp)
                 }
-                ModePill("웹뷰", viewMode == FanboxViewMode.WEB) {
-                    viewModeName = FanboxViewMode.WEB.name
-                }
-            }
+                Text(
+                    "FANBOX",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = colors.ink,
+                )
 
-            Spacer(Modifier.weight(1f))
+                Spacer(Modifier.weight(1f))
 
-            // R-18 Toggle (Play Store friendly: defaults OFF)
-            if (viewMode == FanboxViewMode.FEED) {
+                // R-18 Filter Toggle
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(9.dp))
@@ -317,99 +414,92 @@ internal fun FanboxHubScreen(
                         color = if (showAdult) colors.accent else colors.muted,
                     )
                 }
-            }
 
-            // Update Button
-            IconButton(
-                onClick = onOpenUpdate,
-                modifier = Modifier
-                    .size(34.dp)
-                    .clip(RoundedCornerShape(9.dp))
-                    .background(if (hasUpdate) colors.accentSoft else colors.surface)
-                    .border(1.dp, if (hasUpdate) colors.accent else colors.border, RoundedCornerShape(9.dp)),
-            ) {
-                Box {
+                // Explicit Web Browser Icon (never auto-triggered!)
+                IconButton(
+                    onClick = {
+                        webModal = WebModalRequest(
+                            url = selectedCreator?.let { "https://${it.creatorId}.fanbox.cc/" } ?: FANBOX_HOME,
+                            title = "FANBOX 웹",
+                            autoCloseOnLogin = !loggedIn,
+                        )
+                    },
+                    modifier = Modifier
+                        .size(34.dp)
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(colors.surface)
+                        .border(1.dp, colors.border, RoundedCornerShape(9.dp)),
+                ) {
+                    Icon(Icons.Rounded.Language, contentDescription = "FANBOX 웹 열기", tint = colors.muted, modifier = Modifier.size(17.dp))
+                }
+
+                // Update Button
+                IconButton(
+                    onClick = onOpenUpdate,
+                    modifier = Modifier
+                        .size(34.dp)
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(if (hasUpdate) colors.accentSoft else colors.surface)
+                        .border(1.dp, if (hasUpdate) colors.accent else colors.border, RoundedCornerShape(9.dp)),
+                ) {
+                    Box {
+                        Icon(
+                            Icons.Rounded.SystemUpdateAlt,
+                            contentDescription = "업데이트 확인",
+                            tint = if (hasUpdate) colors.accent else colors.muted,
+                            modifier = Modifier.size(17.dp),
+                        )
+                        if (hasUpdate) {
+                            Box(
+                                modifier = Modifier
+                                    .size(6.dp)
+                                    .align(Alignment.TopEnd)
+                                    .clip(CircleShape)
+                                    .background(colors.accent),
+                            )
+                        }
+                    }
+                }
+
+                // Theme Toggle
+                IconButton(
+                    onClick = onToggleTheme,
+                    modifier = Modifier
+                        .size(34.dp)
+                        .clip(RoundedCornerShape(9.dp))
+                        .background(colors.surface)
+                        .border(1.dp, colors.border, RoundedCornerShape(9.dp)),
+                ) {
                     Icon(
-                        Icons.Rounded.SystemUpdateAlt,
-                        contentDescription = "업데이트 확인",
-                        tint = if (hasUpdate) colors.accent else colors.muted,
+                        if (darkTheme) Icons.Rounded.LightMode else Icons.Rounded.DarkMode,
+                        contentDescription = "테마 전환",
+                        tint = colors.muted,
                         modifier = Modifier.size(17.dp),
                     )
-                    if (hasUpdate) {
-                        Box(
-                            modifier = Modifier
-                                .size(6.dp)
-                                .align(Alignment.TopEnd)
-                                .clip(CircleShape)
-                                .background(colors.accent),
-                        )
-                    }
                 }
             }
 
-            // Theme Toggle
-            IconButton(
-                onClick = onToggleTheme,
-                modifier = Modifier
-                    .size(34.dp)
-                    .clip(RoundedCornerShape(9.dp))
-                    .background(colors.surface)
-                    .border(1.dp, colors.border, RoundedCornerShape(9.dp)),
-            ) {
-                Icon(
-                    if (darkTheme) Icons.Rounded.LightMode else Icons.Rounded.DarkMode,
-                    contentDescription = "테마 전환",
-                    tint = colors.muted,
-                    modifier = Modifier.size(17.dp),
-                )
+            if (model.savingProgress.isNotEmpty()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(colors.surface)
+                        .padding(horizontal = 14.dp, vertical = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth(), color = colors.accent)
+                    Text(
+                        model.savingProgress,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = colors.ink,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
-        }
 
-        // Saving Progress Banner (if downloading from WebView or Detail)
-        if (model.savingProgress.isNotEmpty()) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(colors.surface)
-                    .padding(horizontal = 14.dp, vertical = 6.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                LinearProgressIndicator(Modifier.fillMaxWidth(), color = colors.accent)
-                Text(
-                    model.savingProgress,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = colors.ink,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-
-        if (viewMode == FanboxViewMode.WEB) {
-            FanboxWebViewPane(
-                initialUrl = webUrl,
-                model = model,
-                onSwitchToFeed = {
-                    loggedIn = FanboxSession.hasLoginCookie()
-                    viewModeName = FanboxViewMode.FEED.name
-                    if (loggedIn) loadFeed(reset = true)
-                },
-            )
-        } else {
-            // Native Feed Mode
-            if (!loggedIn && feedItems.isEmpty()) {
-                FanboxLoginPromptCard(
-                    onLoginInWebView = {
-                        webUrl = "https://www.fanbox.cc/login"
-                        viewModeName = FanboxViewMode.WEB.name
-                    },
-                    onBrowseWeb = {
-                        webUrl = FANBOX_HOME
-                        viewModeName = FanboxViewMode.WEB.name
-                    },
-                )
-            } else {
-                // Sub-tabs row (Home / Supporting / Creators + Grid toggle + Refresh)
+            // Sub-navigation Pills (Home / Supporting / Creators / Search)
+            if (selectedCreator == null) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -417,80 +507,41 @@ internal fun FanboxHubScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    if (selectedCreator != null) {
-                        val cr = selectedCreator!!
-                        Row(
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(colors.surface)
-                                .border(1.dp, colors.border, RoundedCornerShape(10.dp))
-                                .padding(horizontal = 8.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            Icon(
-                                Icons.Rounded.ChevronLeft,
-                                contentDescription = "뒤로",
-                                tint = colors.ink,
-                                modifier = Modifier.size(20.dp).clickable { selectedCreator = null },
-                            )
-                            if (cr.iconUrl != null) {
-                                AsyncImage(
-                                    model = FanboxSession.imageRequest(context, cr.iconUrl),
-                                    contentDescription = cr.name,
-                                    modifier = Modifier.size(24.dp).clip(CircleShape),
-                                    contentScale = ContentScale.Crop,
-                                )
-                            }
-                            Text(
-                                cr.name,
-                                modifier = Modifier.weight(1f),
-                                fontWeight = FontWeight.Bold,
-                                color = colors.ink,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                "웹 ↗",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = colors.accent,
-                                modifier = Modifier.clickable {
-                                    webUrl = "https://${cr.creatorId}.fanbox.cc/"
-                                    viewModeName = FanboxViewMode.WEB.name
-                                },
-                            )
-                        }
-                    } else {
-                        Row(
-                            modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            FeedCategory.entries.forEach { cat ->
-                                val active = category == cat
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(20.dp))
-                                        .background(if (active) colors.accent else colors.surface)
-                                        .border(1.dp, if (active) colors.accent else colors.border, RoundedCornerShape(20.dp))
-                                        .clickable {
-                                            categoryName = cat.name
-                                            selectedCreator = null
-                                        }
-                                        .padding(horizontal = 12.dp, vertical = 6.dp),
-                                ) {
-                                    Text(
-                                        cat.label,
-                                        style = MaterialTheme.typography.labelMedium,
-                                        color = if (active) Color.White else colors.muted,
-                                        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                    Row(
+                        modifier = Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        FeedCategory.entries.forEach { cat ->
+                            val active = category == cat
+                            Row(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(20.dp))
+                                    .background(if (active) colors.accent else colors.surface)
+                                    .border(1.dp, if (active) colors.accent else colors.border, RoundedCornerShape(20.dp))
+                                    .clickable { categoryName = cat.name }
+                                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                if (cat == FeedCategory.SEARCH) {
+                                    Icon(
+                                        Icons.Rounded.Search,
+                                        null,
+                                        tint = if (active) Color.White else colors.muted,
+                                        modifier = Modifier.size(14.dp),
                                     )
                                 }
+                                Text(
+                                    cat.label,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (active) Color.White else colors.muted,
+                                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+                                )
                             }
                         }
                     }
 
-                    if (selectedCreator != null || category != FeedCategory.CREATORS) {
+                    if (category == FeedCategory.HOME || category == FeedCategory.SUPPORTING) {
                         IconButton(
                             onClick = {
                                 gridMode = !gridMode
@@ -500,38 +551,114 @@ internal fun FanboxHubScreen(
                         ) {
                             Icon(
                                 if (gridMode) Icons.Rounded.ViewAgenda else Icons.Rounded.GridView,
-                                contentDescription = "보기 모드 전환",
+                                contentDescription = "보기 모드",
                                 tint = colors.muted,
                                 modifier = Modifier.size(19.dp),
                             )
                         }
-                    }
-
-                    IconButton(
-                        onClick = {
-                            if (category == FeedCategory.CREATORS && selectedCreator == null) loadCreators()
-                            else loadFeed(reset = true)
-                        },
-                        modifier = Modifier.size(34.dp),
-                    ) {
-                        Icon(Icons.Rounded.Refresh, contentDescription = "새로고침", tint = colors.muted, modifier = Modifier.size(19.dp))
+                        IconButton(onClick = { loadFeed(reset = true) }, modifier = Modifier.size(34.dp)) {
+                            Icon(Icons.Rounded.Refresh, contentDescription = "새로고침", tint = colors.muted, modifier = Modifier.size(19.dp))
+                        }
+                    } else if (category == FeedCategory.CREATORS) {
+                        IconButton(onClick = ::loadCreators, modifier = Modifier.size(34.dp)) {
+                            Icon(Icons.Rounded.Refresh, contentDescription = "새로고침", tint = colors.muted, modifier = Modifier.size(19.dp))
+                        }
                     }
                 }
+            }
 
-                // Body Area
-                if (category == FeedCategory.CREATORS && selectedCreator == null) {
+            // Content Area
+            when {
+                selectedCreator != null -> {
+                    val cr = selectedCreator!!
+                    BackHandler { selectedCreator = null }
+                    CreatorProfileAndFeedPane(
+                        creator = cr,
+                        plans = creatorPlans,
+                        posts = remember(feedItems, showAdult) {
+                            if (showAdult) feedItems else feedItems.filterNot { it.hasAdultContent }
+                        },
+                        hiddenAdultCount = remember(feedItems, showAdult) {
+                            if (showAdult) 0 else feedItems.count { it.hasAdultContent }
+                        },
+                        gridMode = gridMode,
+                        onToggleGrid = {
+                            gridMode = !gridMode
+                            prefs.edit().putBoolean("feed_grid_mode", gridMode).apply()
+                        },
+                        loading = feedLoading,
+                        error = feedError,
+                        hasMore = feedNextUrl != null,
+                        followBusy = followBusyId == cr.creatorId,
+                        archivedIds = archivedPostIdMap.keys,
+                        onBack = { selectedCreator = null },
+                        onToggleFollow = { toggleFollow(cr) },
+                        onOpenPlansCheckout = {
+                            webModal = WebModalRequest(
+                                url = "https://${cr.creatorId}.fanbox.cc/plans",
+                                title = "${cr.name} 후원 플랜",
+                            )
+                        },
+                        onEnableAdult = {
+                            showAdult = true
+                            prefs.edit().putBoolean("show_adult", true).apply()
+                        },
+                        onOpenPost = { activePostId = it.id },
+                        onLoadMore = { loadFeed(reset = false) },
+                        onRetry = { loadFeed(reset = true) },
+                        onLogin = {
+                            webModal = WebModalRequest("https://www.fanbox.cc/login", "FANBOX 로그인", autoCloseOnLogin = true)
+                        },
+                    )
+                }
+
+                category == FeedCategory.SEARCH -> {
+                    CreatorSearchPane(
+                        query = searchQuery,
+                        onQueryChange = { searchQuery = it },
+                        onSearch = ::runCreatorSearch,
+                        results = searchResults,
+                        loading = searchLoading,
+                        error = searchError,
+                        hasSearched = hasSearched,
+                        followBusyId = followBusyId,
+                        onSelectCreator = { selectedCreator = it },
+                        onToggleFollow = ::toggleFollow,
+                        onLogin = {
+                            webModal = WebModalRequest("https://www.fanbox.cc/login", "FANBOX 로그인", autoCloseOnLogin = true)
+                        },
+                    )
+                }
+
+                !loggedIn && feedItems.isEmpty() && creators.isEmpty() -> {
+                    FanboxLoginPromptCard(
+                        onLogin = {
+                            webModal = WebModalRequest(
+                                url = "https://www.fanbox.cc/login",
+                                title = "FANBOX 로그인",
+                                autoCloseOnLogin = true,
+                            )
+                        },
+                        onGoSearch = { categoryName = FeedCategory.SEARCH.name },
+                    )
+                }
+
+                category == FeedCategory.CREATORS -> {
                     CreatorsListPane(
                         creators = creators,
                         loading = creatorsLoading,
                         error = creatorsError,
+                        followBusyId = followBusyId,
                         onSelectCreator = { selectedCreator = it },
-                        onOpenWeb = {
-                            webUrl = FANBOX_HOME
-                            viewModeName = FanboxViewMode.WEB.name
+                        onToggleFollow = ::toggleFollow,
+                        onOpenLogin = {
+                            webModal = WebModalRequest("https://www.fanbox.cc/login", "FANBOX 로그인", autoCloseOnLogin = true)
                         },
                         onRetry = ::loadCreators,
                     )
-                } else {
+                }
+
+                else -> {
                     val hiddenAdultCount = remember(feedItems, showAdult) {
                         if (showAdult) 0 else feedItems.count { it.hasAdultContent }
                     }
@@ -552,13 +679,15 @@ internal fun FanboxHubScreen(
                         },
                         onOpenPost = { activePostId = it.id },
                         onSelectCreator = { p ->
-                            selectedCreator = FanboxCreator(p.creatorId, p.creatorName, p.creatorIconUrl, null, "", false)
+                            selectedCreator = FanboxCreator(p.creatorId, "", p.creatorName, p.creatorIconUrl, null, "")
                         },
                         onLoadMore = { loadFeed(reset = false) },
-                        onRetry = { loadFeed(reset = true) },
-                        onOpenWeb = {
-                            webUrl = if (feedError is FanboxResult.AuthRequired) "https://www.fanbox.cc/login" else FANBOX_HOME
-                            viewModeName = FanboxViewMode.WEB.name
+                        onRetry = {
+                            FanboxWebBridge.reloadOrigin()
+                            scope.launch { delay(500); loadFeed(reset = true) }
+                        },
+                        onOpenLogin = {
+                            webModal = WebModalRequest("https://www.fanbox.cc/login", "FANBOX 로그인", autoCloseOnLogin = true)
                         },
                     )
                 }
@@ -568,28 +697,327 @@ internal fun FanboxHubScreen(
 }
 
 @Composable
-private fun ModePill(label: String, selected: Boolean, onClick: () -> Unit) {
+private fun CreatorSearchPane(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    onSearch: () -> Unit,
+    results: List<FanboxCreator>,
+    loading: Boolean,
+    error: FanboxResult<Nothing>?,
+    hasSearched: Boolean,
+    followBusyId: String?,
+    onSelectCreator: (FanboxCreator) -> Unit,
+    onToggleFollow: (FanboxCreator) -> Unit,
+    onLogin: () -> Unit,
+) {
     val colors = LocalAndroidGalleryColors.current
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(7.dp))
-            .background(if (selected) colors.accent else Color.Transparent)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 11.dp, vertical = 5.dp),
-    ) {
-        Text(
-            label,
-            style = MaterialTheme.typography.labelMedium,
-            color = if (selected) Color.White else colors.muted,
-            fontWeight = FontWeight.SemiBold,
+    Column(Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = query,
+                onValueChange = onQueryChange,
+                modifier = Modifier.weight(1f),
+                singleLine = true,
+                shape = RoundedCornerShape(14.dp),
+                placeholder = { Text("작가명, @아이디, fanbox 주소 검색…", style = MaterialTheme.typography.bodySmall) },
+                leadingIcon = { Icon(Icons.Rounded.Search, null, tint = colors.muted) },
+                trailingIcon = if (query.isNotEmpty()) {
+                    {
+                        IconButton(onClick = { onQueryChange("") }) {
+                            Icon(Icons.Rounded.Close, "지우기", tint = colors.muted)
+                        }
+                    }
+                } else null,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { onSearch() }),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedContainerColor = colors.surface,
+                    unfocusedContainerColor = colors.surface,
+                    focusedBorderColor = colors.accent,
+                    unfocusedBorderColor = colors.border,
+                ),
+            )
+            Button(
+                onClick = onSearch,
+                enabled = query.isNotBlank() && !loading,
+                shape = RoundedCornerShape(12.dp),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+            ) {
+                Text("검색")
+            }
+        }
+
+        when {
+            loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = colors.accent)
+            }
+            error != null -> FeedErrorState(error = error, onLogin = onLogin, onRetry = onSearch)
+            !hasSearched -> Box(Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Icon(Icons.Rounded.Search, null, tint = colors.muted, modifier = Modifier.size(36.dp))
+                    Text("작가 이름이나 @ID로 바로 찾아보세요", style = MaterialTheme.typography.titleSmall, color = colors.ink)
+                    Text(
+                        "예: ototo, @작가ID, 또는 https://작가ID.fanbox.cc",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = colors.muted,
+                    )
+                }
+            }
+            results.isEmpty() -> Box(Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
+                Text("검색 결과가 없습니다. 작가의 영문 @ID로도 시도해 보세요.", color = colors.muted, style = MaterialTheme.typography.bodySmall)
+            }
+            else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(results, key = { it.creatorId }) { creator ->
+                    CreatorRowCard(
+                        creator = creator,
+                        followBusy = followBusyId == creator.creatorId,
+                        onClick = { onSelectCreator(creator) },
+                        onToggleFollow = { onToggleFollow(creator) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CreatorProfileAndFeedPane(
+    creator: FanboxCreator,
+    plans: List<FanboxPlan>,
+    posts: List<FanboxPostSummary>,
+    hiddenAdultCount: Int,
+    gridMode: Boolean,
+    onToggleGrid: () -> Unit,
+    loading: Boolean,
+    error: FanboxResult<Nothing>?,
+    hasMore: Boolean,
+    followBusy: Boolean,
+    archivedIds: Set<String>,
+    onBack: () -> Unit,
+    onToggleFollow: () -> Unit,
+    onOpenPlansCheckout: () -> Unit,
+    onEnableAdult: () -> Unit,
+    onOpenPost: (FanboxPostSummary) -> Unit,
+    onLoadMore: () -> Unit,
+    onRetry: () -> Unit,
+    onLogin: () -> Unit,
+) {
+    val colors = LocalAndroidGalleryColors.current
+    val context = LocalContext.current
+    var showPlans by remember(creator.creatorId) { mutableStateOf(false) }
+
+    Column(Modifier.fillMaxSize()) {
+        // Creator Profile Header Card
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(colors.surface)
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                IconButton(onClick = onBack, modifier = Modifier.size(32.dp)) {
+                    Icon(Icons.Rounded.ChevronLeft, "뒤로", tint = colors.ink)
+                }
+                Box(
+                    modifier = Modifier.size(40.dp).clip(CircleShape).background(colors.surfaceElevated),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (creator.iconUrl != null) {
+                        AsyncImage(
+                            model = FanboxSession.imageRequest(context, creator.iconUrl),
+                            contentDescription = creator.name,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop,
+                        )
+                    } else {
+                        Text(creator.name.take(1).uppercase(), fontWeight = FontWeight.Bold, color = colors.accent)
+                    }
+                }
+                Column(Modifier.weight(1f)) {
+                    Text(creator.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = colors.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text("@${creator.creatorId}", style = MaterialTheme.typography.labelSmall, color = colors.muted)
+                }
+
+                // Follow / Unfollow Native Button
+                Button(
+                    onClick = onToggleFollow,
+                    enabled = !followBusy,
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (creator.isFollowed) colors.surfaceElevated else colors.accent,
+                        contentColor = if (creator.isFollowed) colors.ink else Color.White,
+                    ),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                ) {
+                    Icon(
+                        if (creator.isFollowed) Icons.Rounded.Check else Icons.Rounded.PersonAdd,
+                        null,
+                        Modifier.size(15.dp),
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        if (followBusy) "…" else if (creator.isFollowed) "팔로우 중" else "팔로우",
+                        style = MaterialTheme.typography.labelMedium,
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                OutlinedButton(
+                    onClick = { if (plans.isNotEmpty()) showPlans = !showPlans else onOpenPlansCheckout() },
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, if (creator.isSupporting) colors.emerald else colors.secondary),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                ) {
+                    Icon(
+                        Icons.Rounded.CardMembership,
+                        null,
+                        tint = if (creator.isSupporting) colors.emerald else colors.secondary,
+                        modifier = Modifier.size(15.dp),
+                    )
+                    Spacer(Modifier.width(5.dp))
+                    Text(
+                        when {
+                            creator.isSupporting -> "후원중 · 플랜 보기"
+                            plans.isNotEmpty() -> "후원 플랜 ${plans.size}개 ${if (showPlans) "▴" else "▾"}"
+                            else -> "후원 / 구독하기"
+                        },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (creator.isSupporting) colors.emerald else colors.secondary,
+                    )
+                }
+
+                Spacer(Modifier.weight(1f))
+
+                IconButton(onClick = onToggleGrid, modifier = Modifier.size(32.dp)) {
+                    Icon(if (gridMode) Icons.Rounded.ViewAgenda else Icons.Rounded.GridView, "보기 전환", tint = colors.muted, modifier = Modifier.size(18.dp))
+                }
+                IconButton(onClick = onRetry, modifier = Modifier.size(32.dp)) {
+                    Icon(Icons.Rounded.Refresh, "새로고침", tint = colors.muted, modifier = Modifier.size(18.dp))
+                }
+            }
+
+            // Expandable Subscription Plans Strip
+            if (showPlans && plans.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    plans.forEach { plan ->
+                        Column(
+                            modifier = Modifier
+                                .width(190.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(colors.bg)
+                                .border(1.dp, colors.border, RoundedCornerShape(12.dp))
+                                .clickable(onClick = onOpenPlansCheckout)
+                                .padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            Text("¥${plan.fee}/월", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = colors.accent)
+                            Text(plan.title, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, color = colors.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            if (plan.description.isNotBlank()) {
+                                Text(plan.description, style = MaterialTheme.typography.labelSmall, color = colors.muted, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            }
+                            Text("이 플랜 후원하기 ↗", style = MaterialTheme.typography.labelSmall, color = colors.secondary, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+        HorizontalDivider(color = colors.border)
+
+        FeedPostsPane(
+            posts = posts,
+            hiddenAdultCount = hiddenAdultCount,
+            gridMode = gridMode,
+            loading = loading,
+            error = error,
+            hasMore = hasMore,
+            archivedIds = archivedIds,
+            onEnableAdult = onEnableAdult,
+            onOpenPost = onOpenPost,
+            onSelectCreator = {},
+            onLoadMore = onLoadMore,
+            onRetry = onRetry,
+            onOpenLogin = onLogin,
         )
     }
 }
 
 @Composable
+private fun CreatorRowCard(
+    creator: FanboxCreator,
+    followBusy: Boolean,
+    onClick: () -> Unit,
+    onToggleFollow: () -> Unit,
+) {
+    val colors = LocalAndroidGalleryColors.current
+    val context = LocalContext.current
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(colors.surface)
+            .border(1.dp, colors.border, RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick)
+            .padding(12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Box(
+            modifier = Modifier.size(44.dp).clip(CircleShape).background(colors.surfaceElevated),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (creator.iconUrl != null) {
+                AsyncImage(
+                    model = FanboxSession.imageRequest(context, creator.iconUrl),
+                    contentDescription = creator.name,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop,
+                )
+            } else {
+                Text(creator.name.take(1).uppercase(), fontWeight = FontWeight.Bold, color = colors.accent)
+            }
+        }
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(creator.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = colors.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                if (creator.isSupporting) {
+                    FeedTagPill(if (creator.planFee > 0) "후원 ¥${creator.planFee}" else "후원중", colors.emeraldSoft, colors.emerald)
+                }
+            }
+            Text("@${creator.creatorId}", style = MaterialTheme.typography.labelSmall, color = colors.muted)
+            if (creator.description.isNotBlank()) {
+                Text(creator.description, style = MaterialTheme.typography.bodySmall, color = colors.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        OutlinedButton(
+            onClick = onToggleFollow,
+            enabled = !followBusy,
+            shape = RoundedCornerShape(9.dp),
+            border = BorderStroke(1.dp, if (creator.isFollowed) colors.border else colors.accent),
+            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 5.dp),
+        ) {
+            Text(
+                if (followBusy) "…" else if (creator.isFollowed) "팔로우 중" else "팔로우",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (creator.isFollowed) colors.muted else colors.accent,
+            )
+        }
+    }
+}
+
+@Composable
 private fun FanboxLoginPromptCard(
-    onLoginInWebView: () -> Unit,
-    onBrowseWeb: () -> Unit,
+    onLogin: () -> Unit,
+    onGoSearch: () -> Unit,
 ) {
     val colors = LocalAndroidGalleryColors.current
     Box(Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
@@ -612,38 +1040,29 @@ private fun FanboxLoginPromptCard(
             ) {
                 Icon(Icons.AutoMirrored.Rounded.Login, null, tint = Color.White, modifier = Modifier.size(28.dp))
             }
+            Text("FANBOX 로그인", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = colors.ink)
             Text(
-                "FANBOX 바로 보기",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
-                color = colors.ink,
-            )
-            Text(
-                "앱 내 웹뷰에서 pixiv 계정에 한 번만 로그인하면 후원·팔로우 중인 작가의 새 글을 네이티브 피드로 바로 보고 원탭으로 내 보관함에 저장할 수 있습니다.",
+                "pixiv 계정에 한 번 로그인하면 자동으로 피드로 돌아와 후원·팔로우 작가의 새 글을 바로 감상하고 보관함에 저장할 수 있습니다.",
                 style = MaterialTheme.typography.bodySmall,
                 color = colors.muted,
             )
-            Button(
-                onClick = onLoginInWebView,
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp),
-            ) {
+            Button(onClick = onLogin, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp)) {
                 Icon(Icons.AutoMirrored.Rounded.Login, null, Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text("앱 안에서 FANBOX 로그인")
+                Text("FANBOX 로그인하기")
             }
             OutlinedButton(
-                onClick = onBrowseWeb,
+                onClick = onGoSearch,
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(12.dp),
                 border = BorderStroke(1.dp, colors.border),
             ) {
-                Icon(Icons.Rounded.Language, null, Modifier.size(18.dp))
+                Icon(Icons.Rounded.Search, null, Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text("웹뷰로 바로 둘러보기")
+                Text("로그인 없이 작가 검색해보기")
             }
             Text(
-                "비공식 클라이언트입니다. 로그인 쿠키는 기기 내부에만 저장됩니다.",
+                "비공식 클라이언트입니다. 로그인 정보는 기기 내부에만 유지됩니다.",
                 style = MaterialTheme.typography.labelSmall,
                 color = colors.muted,
             )
@@ -656,13 +1075,13 @@ private fun CreatorsListPane(
     creators: List<FanboxCreator>,
     loading: Boolean,
     error: FanboxResult<Nothing>?,
+    followBusyId: String?,
     onSelectCreator: (FanboxCreator) -> Unit,
-    onOpenWeb: () -> Unit,
+    onToggleFollow: (FanboxCreator) -> Unit,
+    onOpenLogin: () -> Unit,
     onRetry: () -> Unit,
 ) {
     val colors = LocalAndroidGalleryColors.current
-    val context = LocalContext.current
-
     if (loading && creators.isEmpty()) {
         Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             CircularProgressIndicator(color = colors.accent)
@@ -670,89 +1089,26 @@ private fun CreatorsListPane(
         return
     }
     if (error != null && creators.isEmpty()) {
-        FeedErrorState(error, onOpenWeb, onRetry)
+        FeedErrorState(error, onOpenLogin, onRetry)
         return
     }
     if (creators.isEmpty()) {
         Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-            Text("후원 또는 팔로우 중인 작가가 없습니다.", color = colors.muted)
+            Text("후원 또는 팔로우 중인 작가가 없습니다. ‘작가 찾기’에서 추가해 보세요!", color = colors.muted, style = MaterialTheme.typography.bodySmall)
         }
         return
     }
-
     LazyColumn(
         contentPadding = PaddingValues(14.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         items(creators, key = { it.creatorId }) { creator ->
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(colors.surface)
-                    .border(1.dp, colors.border, RoundedCornerShape(14.dp))
-                    .clickable { onSelectCreator(creator) }
-                    .padding(12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(46.dp)
-                        .clip(CircleShape)
-                        .background(colors.surfaceElevated),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    if (creator.iconUrl != null) {
-                        AsyncImage(
-                            model = FanboxSession.imageRequest(context, creator.iconUrl),
-                            contentDescription = creator.name,
-                            modifier = Modifier.fillMaxSize(),
-                            contentScale = ContentScale.Crop,
-                        )
-                    } else {
-                        Text(creator.name.take(1).uppercase(), fontWeight = FontWeight.Bold, color = colors.accent)
-                    }
-                }
-                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text(
-                            creator.name,
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = colors.ink,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        if (creator.isSupporting) {
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(colors.emeraldSoft)
-                                    .padding(horizontal = 6.dp, vertical = 2.dp),
-                            ) {
-                                Text(
-                                    if (creator.planFee > 0) "후원 ¥${creator.planFee}" else "후원중",
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = colors.emerald,
-                                )
-                            }
-                        }
-                    }
-                    Text("@${creator.creatorId}", style = MaterialTheme.typography.labelSmall, color = colors.muted)
-                    if (creator.description.isNotBlank()) {
-                        Text(
-                            creator.description,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = colors.muted,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-                Icon(Icons.Rounded.ChevronRight, null, tint = colors.muted)
-            }
+            CreatorRowCard(
+                creator = creator,
+                followBusy = followBusyId == creator.creatorId,
+                onClick = { onSelectCreator(creator) },
+                onToggleFollow = { onToggleFollow(creator) },
+            )
         }
     }
 }
@@ -771,7 +1127,7 @@ private fun FeedPostsPane(
     onSelectCreator: (FanboxPostSummary) -> Unit,
     onLoadMore: () -> Unit,
     onRetry: () -> Unit,
-    onOpenWeb: () -> Unit,
+    onOpenLogin: () -> Unit,
 ) {
     val colors = LocalAndroidGalleryColors.current
 
@@ -782,7 +1138,7 @@ private fun FeedPostsPane(
         return
     }
     if (error != null && posts.isEmpty()) {
-        FeedErrorState(error, onOpenWeb, onRetry)
+        FeedErrorState(error, onOpenLogin, onRetry)
         return
     }
 
@@ -807,7 +1163,7 @@ private fun FeedPostsPane(
                 ) {
                     Icon(Icons.Rounded.Shield, null, tint = colors.muted, modifier = Modifier.size(16.dp))
                     Text(
-                        "R-18 게시글 ${hiddenAdultCount}개가 숨겨져 있습니다 · 탭하여 표시",
+                        "R-18 게시글 ${hiddenAdultCount}개 숨김 · 탭하여 모두 표시",
                         style = MaterialTheme.typography.labelMedium,
                         color = colors.muted,
                     )
@@ -842,11 +1198,7 @@ private fun FeedPostsPane(
                     if (loading) {
                         CircularProgressIndicator(modifier = Modifier.size(24.dp), color = colors.accent)
                     } else {
-                        OutlinedButton(
-                            onClick = onLoadMore,
-                            shape = RoundedCornerShape(12.dp),
-                            border = BorderStroke(1.dp, colors.border),
-                        ) {
+                        OutlinedButton(onClick = onLoadMore, shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, colors.border)) {
                             Text("더 불러오기")
                         }
                     }
@@ -874,7 +1226,6 @@ private fun FeedListCard(
             .border(1.dp, colors.border, RoundedCornerShape(16.dp))
             .clickable(onClick = onClick),
     ) {
-        // Creator header
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -901,38 +1252,20 @@ private fun FeedListCard(
                     }
                 }
                 Column {
-                    Text(
-                        post.creatorName,
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.SemiBold,
-                        color = colors.ink,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    Text(post.creatorName, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold, color = colors.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text(post.displayDate, style = MaterialTheme.typography.labelSmall, color = colors.muted)
                 }
             }
 
-            if (isArchived) {
-                FeedTagPill("보관됨", colors.emeraldSoft, colors.emerald)
-            }
-            if (post.feeRequired > 0) {
-                FeedTagPill("¥${post.feeRequired}", colors.secondarySoft, colors.secondary)
-            } else {
-                FeedTagPill("무료", colors.surfaceElevated, colors.muted)
-            }
-            if (post.hasAdultContent) {
-                FeedTagPill("R-18", colors.accentSoft, colors.accent)
-            }
+            if (isArchived) FeedTagPill("보관됨", colors.emeraldSoft, colors.emerald)
+            if (post.feeRequired > 0) FeedTagPill("¥${post.feeRequired}", colors.secondarySoft, colors.secondary)
+            else FeedTagPill("무료", colors.surfaceElevated, colors.muted)
+            if (post.hasAdultContent) FeedTagPill("R-18", colors.accentSoft, colors.accent)
         }
 
-        // Cover Image
         if (post.coverImageUrl != null) {
             Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(1.45f)
-                    .background(colors.surfaceElevated),
+                modifier = Modifier.fillMaxWidth().aspectRatio(1.45f).background(colors.surfaceElevated),
             ) {
                 AsyncImage(
                     model = FanboxSession.imageRequest(context, post.coverImageUrl),
@@ -959,33 +1292,12 @@ private fun FeedListCard(
             }
         }
 
-        // Title & Excerpt
-        Column(
-            modifier = Modifier.padding(horizontal = 13.dp, vertical = 11.dp),
-            verticalArrangement = Arrangement.spacedBy(5.dp),
-        ) {
-            Text(
-                post.title,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = colors.ink,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
+        Column(modifier = Modifier.padding(horizontal = 13.dp, vertical = 11.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            Text(post.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = colors.ink, maxLines = 2, overflow = TextOverflow.Ellipsis)
             if (post.excerpt.isNotBlank()) {
-                Text(
-                    post.excerpt,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = colors.muted,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Text(post.excerpt, style = MaterialTheme.typography.bodySmall, color = colors.muted, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(5.dp),
-                modifier = Modifier.padding(top = 2.dp),
-            ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.padding(top = 2.dp)) {
                 Icon(Icons.Rounded.Favorite, null, tint = colors.accent.copy(alpha = 0.8f), modifier = Modifier.size(14.dp))
                 Text("${post.likeCount}", style = MaterialTheme.typography.labelSmall, color = colors.muted)
             }
@@ -1010,10 +1322,7 @@ private fun FeedGridCard(
             .clickable(onClick = onClick),
     ) {
         Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .aspectRatio(0.8f)
-                .background(colors.surfaceElevated),
+            modifier = Modifier.fillMaxWidth().aspectRatio(0.8f).background(colors.surfaceElevated),
             contentAlignment = Alignment.Center,
         ) {
             if (post.coverImageUrl != null) {
@@ -1031,34 +1340,15 @@ private fun FeedGridCard(
                 modifier = Modifier.fillMaxWidth().align(Alignment.TopCenter).padding(6.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                if (isArchived) {
-                    FeedTagPill("보관됨", Color(0xCC059669), Color.White)
-                } else {
-                    Spacer(Modifier.width(1.dp))
-                }
-                if (post.isRestricted) {
-                    FeedTagPill("잠금", Color(0xCC11141C), Color.White)
-                } else if (post.feeRequired > 0) {
-                    FeedTagPill("¥${post.feeRequired}", Color(0xCC4F46E5), Color.White)
-                }
+                if (isArchived) FeedTagPill("보관됨", Color(0xCC059669), Color.White)
+                else Spacer(Modifier.width(1.dp))
+                if (post.isRestricted) FeedTagPill("잠금", Color(0xCC11141C), Color.White)
+                else if (post.feeRequired > 0) FeedTagPill("¥${post.feeRequired}", Color(0xCC4F46E5), Color.White)
             }
         }
         Column(modifier = Modifier.padding(9.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(
-                post.title,
-                style = MaterialTheme.typography.bodySmall,
-                fontWeight = FontWeight.SemiBold,
-                color = colors.ink,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                post.creatorName,
-                style = MaterialTheme.typography.labelSmall,
-                color = colors.muted,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Text(post.title, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold, color = colors.ink, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Text(post.creatorName, style = MaterialTheme.typography.labelSmall, color = colors.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
 }
@@ -1066,10 +1356,7 @@ private fun FeedGridCard(
 @Composable
 private fun FeedTagPill(text: String, bg: Color, fg: Color) {
     Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(7.dp))
-            .background(bg)
-            .padding(horizontal = 6.dp, vertical = 2.dp),
+        modifier = Modifier.clip(RoundedCornerShape(7.dp)).background(bg).padding(horizontal = 6.dp, vertical = 2.dp),
     ) {
         Text(text, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = fg)
     }
@@ -1078,15 +1365,15 @@ private fun FeedTagPill(text: String, bg: Color, fg: Color) {
 @Composable
 private fun FeedErrorState(
     error: FanboxResult<Nothing>,
-    onOpenWeb: () -> Unit,
+    onLogin: () -> Unit,
     onRetry: () -> Unit,
 ) {
     val colors = LocalAndroidGalleryColors.current
-    val (title, body, webBtn) = when (error) {
-        is FanboxResult.AuthRequired -> Triple("로그인이 필요합니다", error.message, "웹뷰에서 로그인")
-        is FanboxResult.CloudflareBlocked -> Triple("보안 확인 필요", error.message, "웹뷰에서 인증")
-        is FanboxResult.Error -> Triple("불러올 수 없습니다", error.message, "웹뷰로 열기")
-        is FanboxResult.Success -> Triple("오류", "알 수 없는 상태입니다.", "웹뷰로 열기")
+    val (title, body, needsLogin) = when (error) {
+        is FanboxResult.AuthRequired -> Triple("로그인이 필요합니다", error.message, true)
+        is FanboxResult.CloudflareBlocked -> Triple("연결 확인 중", error.message, false)
+        is FanboxResult.Error -> Triple("불러올 수 없습니다", error.message, false)
+        is FanboxResult.Success -> Triple("오류", "알 수 없는 상태입니다.", false)
     }
     Box(Modifier.fillMaxSize().padding(22.dp), contentAlignment = Alignment.Center) {
         Column(
@@ -1102,8 +1389,10 @@ private fun FeedErrorState(
             Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = colors.ink)
             Text(body, style = MaterialTheme.typography.bodySmall, color = colors.muted)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onOpenWeb, shape = RoundedCornerShape(10.dp)) { Text(webBtn) }
-                OutlinedButton(onClick = onRetry, shape = RoundedCornerShape(10.dp)) { Text("다시 시도") }
+                Button(onClick = onRetry, shape = RoundedCornerShape(10.dp)) { Text("다시 시도") }
+                if (needsLogin) {
+                    OutlinedButton(onClick = onLogin, shape = RoundedCornerShape(10.dp)) { Text("로그인") }
+                }
             }
         }
     }
@@ -1134,12 +1423,12 @@ private fun FanboxPostDetailScreen(
     var loading by remember(postId) { mutableStateOf(true) }
     var detail by remember(postId) { mutableStateOf<FanboxPostDetail?>(null) }
     var error by remember(postId) { mutableStateOf<FanboxResult<Nothing>?>(null) }
+    var reloadKey by remember(postId) { mutableIntStateOf(0) }
 
-    LaunchedEffect(postId) {
+    LaunchedEffect(postId, reloadKey) {
         loading = true
         error = null
-        val res = withContext(Dispatchers.IO) { FanboxClient.fetchPostDetail(context, postId) }
-        when (res) {
+        when (val res = FanboxClient.fetchPostDetail(context, postId)) {
             is FanboxResult.Success -> detail = res.data
             is FanboxResult.AuthRequired -> error = res
             is FanboxResult.CloudflareBlocked -> error = res
@@ -1170,12 +1459,8 @@ private fun FanboxPostDetailScreen(
             },
     ) {
         Column(Modifier.fillMaxSize()) {
-            // Detail Top Bar
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(colors.surface)
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                modifier = Modifier.fillMaxWidth().background(colors.surface).padding(horizontal = 8.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 TextButton(onClick = onBack) { Text("‹ 피드", color = colors.ink, fontWeight = FontWeight.SemiBold) }
@@ -1190,17 +1475,14 @@ private fun FanboxPostDetailScreen(
                     }
                 }
                 val webTarget = detail?.summary?.postUrl ?: feedList.getOrNull(idx)?.postUrl ?: FANBOX_HOME
-                TextButton(onClick = { onOpenInWeb(webTarget) }) { Text("웹뷰 ↗", color = colors.accent) }
+                IconButton(onClick = { onOpenInWeb(webTarget) }, modifier = Modifier.size(34.dp)) {
+                    Icon(Icons.Rounded.Language, "원문 웹", tint = colors.muted, modifier = Modifier.size(18.dp))
+                }
             }
 
             if (model.savingProgress.isNotEmpty()) {
                 LinearProgressIndicator(Modifier.fillMaxWidth(), color = colors.accent)
-                Text(
-                    model.savingProgress,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = colors.ink,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp),
-                )
+                Text(model.savingProgress, style = MaterialTheme.typography.labelSmall, color = colors.ink, modifier = Modifier.padding(horizontal = 14.dp, vertical = 4.dp))
             }
 
             when {
@@ -1209,8 +1491,8 @@ private fun FanboxPostDetailScreen(
                 }
                 error != null -> FeedErrorState(
                     error = error!!,
-                    onOpenWeb = { onOpenInWeb(feedList.getOrNull(idx)?.postUrl ?: FANBOX_HOME) },
-                    onRetry = { onSelectPost(postId) },
+                    onLogin = { onOpenInWeb("https://www.fanbox.cc/login") },
+                    onRetry = { reloadKey++ },
                 )
                 detail != null -> {
                     val d = detail!!
@@ -1224,7 +1506,6 @@ private fun FanboxPostDetailScreen(
                     ) {
                         item(span = { GridItemSpan(maxLineSpan) }) {
                             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                                // Creator bar
                                 Row(
                                     modifier = Modifier
                                         .clip(RoundedCornerShape(10.dp))
@@ -1243,22 +1524,12 @@ private fun FanboxPostDetailScreen(
                                     }
                                     Column {
                                         Text(s.creatorName, fontWeight = FontWeight.Bold, color = colors.ink)
-                                        Text(
-                                            "${s.displayDate} · ${if (s.feeRequired > 0) "¥${s.feeRequired} 플랜" else "무료 공개"}",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = colors.muted,
-                                        )
+                                        Text("${s.displayDate} · ${if (s.feeRequired > 0) "¥${s.feeRequired} 플랜" else "무료 공개"}", style = MaterialTheme.typography.labelSmall, color = colors.muted)
                                     }
                                 }
 
-                                Text(
-                                    s.title,
-                                    style = MaterialTheme.typography.headlineSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    color = colors.ink,
-                                )
+                                Text(s.title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold, color = colors.ink)
 
-                                // One-tap Save into Offline Library CTA
                                 val assetTotal = d.images.size + d.files.size
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Button(
@@ -1294,19 +1565,21 @@ private fun FanboxPostDetailScreen(
                                 }
 
                                 if (s.isRestricted && assetTotal == 0) {
-                                    Box(
+                                    Column(
                                         modifier = Modifier
                                             .fillMaxWidth()
                                             .clip(RoundedCornerShape(12.dp))
                                             .background(colors.surface)
                                             .border(1.dp, colors.border, RoundedCornerShape(12.dp))
                                             .padding(14.dp),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp),
                                     ) {
-                                        Text(
-                                            "후원자 한정 게시글입니다. 웹뷰에서 플랜을 확인하거나 후원 후 다시 열어보세요.",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = colors.muted,
-                                        )
+                                        Text("후원자 한정 게시글입니다.", style = MaterialTheme.typography.titleSmall, color = colors.ink)
+                                        Text("작가 페이지에서 후원 플랜을 확인하고 구독할 수 있습니다.", style = MaterialTheme.typography.bodySmall, color = colors.muted)
+                                        OutlinedButton(
+                                            onClick = { onSelectCreator(s.creatorId, s.creatorName, s.creatorIconUrl) },
+                                            shape = RoundedCornerShape(10.dp),
+                                        ) { Text("작가 플랜 보기") }
                                     }
                                 }
 
@@ -1315,19 +1588,13 @@ private fun FanboxPostDetailScreen(
                                 }
 
                                 if (d.tags.isNotEmpty()) {
-                                    Row(
-                                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                    ) {
-                                        d.tags.forEach { tag ->
-                                            FeedTagPill("#$tag", colors.surface, colors.muted)
-                                        }
+                                    Row(modifier = Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        d.tags.forEach { tag -> FeedTagPill("#$tag", colors.surface, colors.muted) }
                                     }
                                 }
                             }
                         }
 
-                        // 3-Column Online Images Grid
                         itemsIndexed(d.images, key = { _, img -> img.id }) { imgIdx, img ->
                             Box(
                                 modifier = Modifier
@@ -1348,22 +1615,11 @@ private fun FanboxPostDetailScreen(
                             }
                         }
 
-                        // Attachments
                         if (d.files.isNotEmpty()) {
                             item(span = { GridItemSpan(maxLineSpan) }) {
-                                Text(
-                                    "첨부 파일 · ${d.files.size}개",
-                                    style = MaterialTheme.typography.titleSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    color = colors.muted,
-                                    modifier = Modifier.padding(top = 6.dp),
-                                )
+                                Text("첨부 파일 · ${d.files.size}개", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = colors.muted, modifier = Modifier.padding(top = 6.dp))
                             }
-                            items(
-                                items = d.files,
-                                key = { it.id },
-                                span = { GridItemSpan(maxLineSpan) },
-                            ) { file ->
+                            items(items = d.files, key = { it.id }, span = { GridItemSpan(maxLineSpan) }) { file ->
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
@@ -1375,21 +1631,14 @@ private fun FanboxPostDetailScreen(
                                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                                 ) {
                                     Box(
-                                        modifier = Modifier
-                                            .size(38.dp)
-                                            .clip(RoundedCornerShape(9.dp))
-                                            .background(colors.secondarySoft),
+                                        modifier = Modifier.size(38.dp).clip(RoundedCornerShape(9.dp)).background(colors.secondarySoft),
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         Icon(Icons.Rounded.FolderZip, null, tint = colors.secondary, modifier = Modifier.size(19.dp))
                                     }
                                     Column(Modifier.weight(1f)) {
                                         Text(file.fileName, maxLines = 2, overflow = TextOverflow.Ellipsis, color = colors.ink, style = MaterialTheme.typography.bodySmall)
-                                        Text(
-                                            Formatter.formatFileSize(context, file.size),
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = colors.muted,
-                                        )
+                                        Text(Formatter.formatFileSize(context, file.size), style = MaterialTheme.typography.labelSmall, color = colors.muted)
                                     }
                                 }
                             }
@@ -1461,10 +1710,7 @@ private fun OnlineImageLightbox(
                     contentDescription = img.fileName,
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxSize().graphicsLayer {
-                        scaleX = scale
-                        scaleY = scale
-                        translationX = offset.x
-                        translationY = offset.y
+                        scaleX = scale; scaleY = scale; translationX = offset.x; translationY = offset.y
                     },
                     loading = { Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = colors.accent) } },
                 )
@@ -1475,42 +1721,42 @@ private fun OnlineImageLightbox(
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-private fun FanboxWebViewPane(
-    initialUrl: String,
+private fun FanboxWebModalScreen(
+    request: WebModalRequest,
     model: ArchiveModel,
-    onSwitchToFeed: () -> Unit,
+    onClose: (didLogin: Boolean) -> Unit,
 ) {
     val colors = LocalAndroidGalleryColors.current
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var canGoBack by remember { mutableStateOf(false) }
     var canGoForward by remember { mutableStateOf(false) }
-    var pageTitle by remember { mutableStateOf("FANBOX") }
-    var currentUrl by remember { mutableStateOf(initialUrl) }
+    var pageTitle by remember { mutableStateOf(request.title) }
+    var currentUrl by remember { mutableStateOf(request.url) }
     var progress by remember { mutableIntStateOf(0) }
-    var loginDetected by remember { mutableStateOf(FanboxSession.hasLoginCookie()) }
+    val initiallyLoggedIn = remember { FanboxSession.hasLoginCookie() }
+    var nowLoggedIn by remember { mutableStateOf(initiallyLoggedIn) }
 
-    BackHandler(enabled = canGoBack) {
-        webViewRef?.goBack()
+    BackHandler {
+        if (canGoBack) webViewRef?.goBack() else onClose(nowLoggedIn && !initiallyLoggedIn)
     }
 
-    Column(Modifier.fillMaxSize()) {
-        // Compact WebView Toolbar
+    Column(Modifier.fillMaxSize().background(colors.bg)) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(colors.surface)
-                .padding(horizontal = 6.dp, vertical = 2.dp),
+            modifier = Modifier.fillMaxWidth().background(colors.surface).padding(horizontal = 6.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(2.dp),
         ) {
-            IconButton(onClick = { webViewRef?.goBack() }, enabled = canGoBack, modifier = Modifier.size(34.dp)) {
-                Icon(Icons.AutoMirrored.Rounded.ArrowBack, "뒤로", modifier = Modifier.size(18.dp))
+            TextButton(onClick = { onClose(nowLoggedIn) }) {
+                Text("‹ 피드로", color = colors.ink, fontWeight = FontWeight.SemiBold)
             }
-            IconButton(onClick = { webViewRef?.goForward() }, enabled = canGoForward, modifier = Modifier.size(34.dp)) {
-                Icon(Icons.AutoMirrored.Rounded.ArrowForward, "앞으로", modifier = Modifier.size(18.dp))
+            IconButton(onClick = { webViewRef?.goBack() }, enabled = canGoBack, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.AutoMirrored.Rounded.ArrowBack, "뒤로", modifier = Modifier.size(17.dp))
             }
-            IconButton(onClick = { webViewRef?.reload() }, modifier = Modifier.size(34.dp)) {
-                Icon(Icons.Rounded.Refresh, "새로고침", modifier = Modifier.size(18.dp))
+            IconButton(onClick = { webViewRef?.goForward() }, enabled = canGoForward, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.AutoMirrored.Rounded.ArrowForward, "앞으로", modifier = Modifier.size(17.dp))
+            }
+            IconButton(onClick = { webViewRef?.reload() }, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Rounded.Refresh, "새로고침", modifier = Modifier.size(17.dp))
             }
             Text(
                 pageTitle,
@@ -1520,32 +1766,24 @@ private fun FanboxWebViewPane(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
-            TextButton(onClick = onSwitchToFeed) {
-                Text("피드로 보기", color = colors.accent, fontWeight = FontWeight.SemiBold)
-            }
         }
 
         if (progress in 1..99) {
             LinearProgressIndicator(progress = { progress / 100f }, modifier = Modifier.fillMaxWidth(), color = colors.accent)
         }
 
-        if (loginDetected) {
+        if (nowLoggedIn && !initiallyLoggedIn) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(colors.emeraldSoft)
-                    .clickable(onClick = onSwitchToFeed)
-                    .padding(horizontal = 14.dp, vertical = 7.dp),
+                    .clickable { onClose(true) }
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Icon(Icons.Rounded.AutoAwesome, null, tint = colors.emerald, modifier = Modifier.size(16.dp))
-                Text(
-                    "로그인 세션 확인됨 · 탭해서 네이티브 피드로 바로 보기",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = colors.emerald,
-                )
+                Text("로그인 완료! 피드로 돌아갑니다…", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = colors.emerald)
             }
         }
 
@@ -1563,16 +1801,12 @@ private fun FanboxWebViewPane(
                     settings.builtInZoomControls = true
                     settings.displayZoomControls = false
                     webChromeClient = object : WebChromeClient() {
-                        override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                            progress = newProgress
-                        }
-                        override fun onReceivedTitle(view: WebView?, title: String?) {
-                            if (!title.isNullOrBlank()) pageTitle = title
-                        }
+                        override fun onProgressChanged(view: WebView?, newProgress: Int) { progress = newProgress }
+                        override fun onReceivedTitle(view: WebView?, title: String?) { if (!title.isNullOrBlank()) pageTitle = title }
                     }
                     webViewClient = object : WebViewClient() {
-                        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                            val u = request?.url?.toString().orEmpty()
+                        override fun shouldOverrideUrlLoading(view: WebView?, req: WebResourceRequest?): Boolean {
+                            val u = req?.url?.toString().orEmpty()
                             return !(u.startsWith("https://") || u.startsWith("http://"))
                         }
                         override fun onPageFinished(view: WebView?, url: String?) {
@@ -1580,25 +1814,24 @@ private fun FanboxWebViewPane(
                             canGoForward = view?.canGoForward() == true
                             if (!url.isNullOrBlank()) currentUrl = url
                             FanboxSession.flushCookies()
-                            loginDetected = FanboxSession.hasLoginCookie()
+                            val logged = FanboxSession.hasLoginCookie()
+                            nowLoggedIn = logged
+                            if (request.autoCloseOnLogin && !initiallyLoggedIn && logged &&
+                                url != null && url.contains("fanbox.cc") && !url.contains("/login")
+                            ) {
+                                onClose(true)
+                            }
                         }
                     }
                     setDownloadListener { url, _, contentDisposition, mimeType, _ ->
                         val guessed = URLUtil.guessFileName(url, contentDisposition, mimeType)
-                        model.saveWebDownload(
-                            url = url,
-                            fileName = guessed,
-                            pageUrl = currentUrl,
-                            pageTitle = pageTitle,
-                        )
+                        model.saveWebDownload(url = url, fileName = guessed, pageUrl = currentUrl, pageTitle = pageTitle)
                     }
-                    loadUrl(initialUrl)
+                    loadUrl(request.url)
                     webViewRef = this
                 }
             },
-            update = { view ->
-                webViewRef = view
-            },
+            update = { webViewRef = it },
         )
     }
 }

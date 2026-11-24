@@ -37,6 +37,7 @@ dependencies {
     implementation(compose.materialIconsExtended)
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.10.2")
     implementation("com.twelvemonkeys.imageio:imageio-webp:3.12.0")
+    implementation("org.apache.pdfbox:pdfbox:3.0.3")
     testImplementation("org.jetbrains.compose.ui:ui-test:1.9.1")
     testImplementation("junit:junit:4.13.2")
 }
@@ -49,7 +50,7 @@ compose.desktop {
             packageName = "FanboxLibrary"
             packageVersion = nativePackageVersion
             description = "Offline library for personally saved FANBOX posts and attachments"
-            modules("java.desktop", "jdk.unsupported", "jdk.charsets", "jdk.crypto.ec")
+            modules("java.desktop", "java.logging", "java.xml", "jdk.unsupported", "jdk.charsets", "jdk.crypto.ec")
             windows {
                 perUserInstall = true
                 menu = true

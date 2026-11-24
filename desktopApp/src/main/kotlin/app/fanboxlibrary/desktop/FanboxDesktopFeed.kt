@@ -15,6 +15,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.Login
 import androidx.compose.material.icons.automirrored.rounded.Logout
@@ -142,6 +143,7 @@ internal fun DesktopFanboxHub(
     var activePost by remember { mutableStateOf<DesktopFanboxPostSummary?>(null) }
     var savingJob by remember { mutableStateOf<Job?>(null) }
     var savingProgress by remember { mutableStateOf("") }
+    val resolvedRewardsMap = remember { mutableStateMapOf<String, List<ResolvedRewardItem>>() }
 
     val archivedMap = remember(libraryPosts) {
         buildMap {
@@ -386,6 +388,83 @@ internal fun DesktopFanboxHub(
                 onLibraryUpdated("저장을 중단했습니다. (지금까지 추가 ${added}개)")
             } catch (e: Exception) {
                 onLibraryUpdated("저장 실패: ${e.localizedMessage ?: e.javaClass.simpleName}")
+            } finally {
+                savingProgress = ""
+                savingJob = null
+            }
+        }
+    }
+
+    fun saveResolvedRewards(detail: DesktopFanboxPostDetail, rewards: List<ResolvedRewardItem>) {
+        val activeStore = store ?: return
+        if (savingJob?.isActive == true || rewards.isEmpty()) return
+        savingJob = scope.launch {
+            try {
+                val draft = PostDraft(
+                    creator = detail.summary.creatorName,
+                    title = detail.summary.title,
+                    year = detail.summary.year,
+                    sourceUrl = detail.summary.postUrl,
+                )
+                val rep = ExternalRewardDownloader.downloadAndImportRewards(
+                    store = activeStore,
+                    draft = draft,
+                    rewards = rewards,
+                    onProgress = { msg -> savingProgress = msg },
+                )
+                onLibraryUpdated("외부 보상 저장 완료 · 추가 ${rep.added}개 · 기존 ${rep.reused}개")
+            } catch (_: CancellationException) {
+                onLibraryUpdated("외부 보상 다운로드를 중단했습니다.")
+            } catch (e: Exception) {
+                onLibraryUpdated("외부 보상 저장 실패: ${e.localizedMessage ?: e.javaClass.simpleName}")
+            } finally {
+                savingProgress = ""
+                savingJob = null
+            }
+        }
+    }
+
+    fun oneClickExternalLink(detail: DesktopFanboxPostDetail, link: DesktopPostExternalLink) {
+        val activeStore = store ?: return
+        if (savingJob?.isActive == true) return
+        savingJob = scope.launch {
+            try {
+                val resolvedRes = ExternalRewardDownloader.resolveRewardLink(link) { msg ->
+                    savingProgress = msg
+                }
+                val rewards = resolvedRes.getOrElse { err ->
+                    onLibraryUpdated("보상 링크 확인 실패: ${err.localizedMessage ?: err.javaClass.simpleName}")
+                    return@launch
+                }
+                if (rewards.isEmpty()) {
+                    onLibraryUpdated("보상 페이지에서 다운로드 링크를 찾지 못했습니다.")
+                    return@launch
+                }
+                resolvedRewardsMap[link.url] = rewards
+
+                // If exactly 1 reward was found, download & unpack into Library immediately in 1 click!
+                // If multiple packs exist on a monthly hub page (e.g. Deluxe Sketch + Comic PSD), show them inline so the user can pick 1 or save all!
+                if (rewards.size == 1) {
+                    val draft = PostDraft(
+                        creator = detail.summary.creatorName,
+                        title = detail.summary.title,
+                        year = detail.summary.year,
+                        sourceUrl = detail.summary.postUrl,
+                    )
+                    val rep = ExternalRewardDownloader.downloadAndImportRewards(
+                        store = activeStore,
+                        draft = draft,
+                        rewards = rewards,
+                        onProgress = { msg -> savingProgress = msg },
+                    )
+                    onLibraryUpdated("원클릭 보상 저장 완료 · 추가 ${rep.added}개 · 기존 ${rep.reused}개")
+                } else {
+                    onLibraryUpdated("보상 링크 ${rewards.size}개를 잠금 해제했습니다. 원하는 항목을 클릭해 바로 저장하세요!")
+                }
+            } catch (_: CancellationException) {
+                onLibraryUpdated("보상 인증 및 다운로드를 중단했습니다.")
+            } catch (e: Exception) {
+                onLibraryUpdated("원클릭 저장 오류: ${e.localizedMessage ?: e.javaClass.simpleName}")
             } finally {
                 savingProgress = ""
                 savingJob = null
@@ -671,12 +750,15 @@ internal fun DesktopFanboxHub(
                     feedList = filteredFeed,
                     archivedLocalId = archivedMap[currentPost.uniqueKey],
                     saving = savingJob?.isActive == true,
+                    resolvedRewardsMap = resolvedRewardsMap,
                     onSelectPost = { activePost = it },
                     onSelectCreator = { id, name, icon, svc ->
                         activePost = null
                         selectedCreator = DesktopFanboxCreator(id, "", name, icon, null, "", service = svc)
                     },
                     onSaveToLibrary = ::saveSinglePost,
+                    onOneClickExternalLink = ::oneClickExternalLink,
+                    onSaveResolvedRewards = ::saveResolvedRewards,
                     onOpenArchived = onOpenArchivedPost,
                     onOpenExternal = ::openExternal,
                     onBack = { activePost = null },
@@ -1758,9 +1840,12 @@ private fun DesktopFanboxPostDetailPane(
     feedList: List<DesktopFanboxPostSummary>,
     archivedLocalId: String?,
     saving: Boolean,
+    resolvedRewardsMap: Map<String, List<ResolvedRewardItem>>,
     onSelectPost: (DesktopFanboxPostSummary) -> Unit,
     onSelectCreator: (String, String, String?, FeedService) -> Unit,
     onSaveToLibrary: (DesktopFanboxPostDetail) -> Unit,
+    onOneClickExternalLink: (DesktopFanboxPostDetail, DesktopPostExternalLink) -> Unit,
+    onSaveResolvedRewards: (DesktopFanboxPostDetail, List<ResolvedRewardItem>) -> Unit,
     onOpenArchived: (String) -> Unit,
     onOpenExternal: (String) -> Unit,
     onBack: () -> Unit,
@@ -1896,6 +1981,22 @@ private fun DesktopFanboxPostDetailPane(
                                 )
                                 Text("· ${s.displayDate}", style = MaterialTheme.typography.bodySmall, color = colors.muted)
                                 Spacer(Modifier.weight(1f))
+                                if (activeDetail.externalLinks.size == 1) {
+                                    val singleLink = activeDetail.externalLinks.first()
+                                    Button(
+                                        onClick = { onOneClickExternalLink(activeDetail, singleLink) },
+                                        enabled = !saving,
+                                        shape = RoundedCornerShape(10.dp),
+                                        colors = ButtonDefaults.buttonColors(containerColor = colors.emerald),
+                                    ) {
+                                        Icon(Icons.Rounded.CloudDownload, null, Modifier.size(16.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(
+                                            if (singleLink.kind == ExternalLinkKind.PATREON_GATE) "원클릭 인증 · 보상 저장"
+                                            else "${singleLink.kind.badge} 원클릭 저장",
+                                        )
+                                    }
+                                }
                                 Button(
                                     onClick = { onSaveToLibrary(activeDetail) },
                                     enabled = totalAssets > 0 && !saving,
@@ -1911,8 +2012,34 @@ private fun DesktopFanboxPostDetailPane(
                                     }
                                 }
                             }
+                            if (activeDetail.externalLinks.isNotEmpty()) {
+                                ExternalRewardsSection(
+                                    detail = activeDetail,
+                                    saving = saving,
+                                    resolvedRewardsMap = resolvedRewardsMap,
+                                    onOneClickExternalLink = { link -> onOneClickExternalLink(activeDetail, link) },
+                                    onSaveResolvedRewards = { items -> onSaveResolvedRewards(activeDetail, items) },
+                                    onOpenExternal = onOpenExternal,
+                                )
+                            }
                             if (activeDetail.text.isNotBlank()) {
-                                Text(activeDetail.text, style = MaterialTheme.typography.bodyMedium, color = colors.ink)
+                                SelectionContainer {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(colors.surface)
+                                            .border(1.dp, colors.border, RoundedCornerShape(12.dp))
+                                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                                    ) {
+                                        Text(
+                                            activeDetail.text,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            lineHeight = 22.sp,
+                                            color = colors.ink,
+                                        )
+                                    }
+                                }
                             }
                             if (activeDetail.tags.isNotEmpty()) {
                                 Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1961,6 +2088,148 @@ private fun DesktopFanboxPostDetailPane(
                                     style = MaterialTheme.typography.bodySmall,
                                     color = colors.muted,
                                 )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExternalRewardsSection(
+    detail: DesktopFanboxPostDetail,
+    saving: Boolean,
+    resolvedRewardsMap: Map<String, List<ResolvedRewardItem>>,
+    onOneClickExternalLink: (DesktopPostExternalLink) -> Unit,
+    onSaveResolvedRewards: (List<ResolvedRewardItem>) -> Unit,
+    onOpenExternal: (String) -> Unit,
+) {
+    val colors = LocalGalleryColors.current
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(colors.surfaceElevated)
+            .border(1.dp, colors.emerald.copy(alpha = 0.45f), RoundedCornerShape(14.dp))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Icon(Icons.Rounded.CloudDownload, null, tint = colors.emerald, modifier = Modifier.size(18.dp))
+            Text(
+                "외부 보상 링크 · 원클릭 인증 & 보관함 자동 저장",
+                style = MaterialTheme.typography.titleSmall,
+                color = colors.ink,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                "ZIP 압축해제 · PDF 만화 페이지 변환 자동 지원",
+                style = MaterialTheme.typography.labelSmall,
+                color = colors.muted,
+            )
+        }
+
+        detail.externalLinks.forEach { link ->
+            val unlockedList = resolvedRewardsMap[link.url].orEmpty()
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(colors.surface)
+                    .border(1.dp, colors.border, RoundedCornerShape(10.dp))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    FeedBadge(
+                        link.kind.badge,
+                        if (link.kind == ExternalLinkKind.DROPBOX) Color(0xFF0061FF) else colors.emerald,
+                    )
+                    Column(Modifier.weight(1f)) {
+                        Text(link.label, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold, color = colors.ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(link.url, style = MaterialTheme.typography.labelSmall, color = colors.muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                    Button(
+                        onClick = { onOneClickExternalLink(link) },
+                        enabled = !saving,
+                        shape = RoundedCornerShape(9.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = colors.emerald),
+                    ) {
+                        Icon(Icons.Rounded.CloudDownload, null, Modifier.size(15.dp))
+                        Spacer(Modifier.width(5.dp))
+                        Text(
+                            when {
+                                unlockedList.size > 1 -> "다시 확인"
+                                link.kind == ExternalLinkKind.PATREON_GATE -> "원클릭 인증 · 바로 저장"
+                                else -> "보관함에 바로 저장"
+                            },
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = { onOpenExternal(link.url) },
+                        shape = RoundedCornerShape(9.dp),
+                    ) {
+                        Icon(Icons.AutoMirrored.Rounded.OpenInNew, null, Modifier.size(14.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("브라우저", style = MaterialTheme.typography.labelMedium)
+                    }
+                }
+
+                if (unlockedList.size > 1) {
+                    HorizontalDivider(color = colors.border)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "잠금 해제된 보상 파일 (${unlockedList.size}개 발견)",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = colors.emerald,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Button(
+                            onClick = { onSaveResolvedRewards(unlockedList) },
+                            enabled = !saving,
+                            shape = RoundedCornerShape(8.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        ) {
+                            Text("발견된 보상 전체 저장 (${unlockedList.size}개)", fontSize = 11.sp)
+                        }
+                    }
+                    unlockedList.forEach { item ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(colors.bg)
+                                .padding(horizontal = 10.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            FeedBadge(item.kind.badge, Color(0xFF0061FF))
+                            Text(
+                                item.label,
+                                modifier = Modifier.weight(1f),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = colors.ink,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Button(
+                                onClick = { onSaveResolvedRewards(listOf(item)) },
+                                enabled = !saving,
+                                shape = RoundedCornerShape(8.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = colors.emerald),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            ) {
+                                Text("이 항목 저장", fontSize = 11.sp)
+                            }
+                            TextButton(onClick = { onOpenExternal(item.originalUrl) }) {
+                                Text("링크 ↗", fontSize = 11.sp)
                             }
                         }
                     }

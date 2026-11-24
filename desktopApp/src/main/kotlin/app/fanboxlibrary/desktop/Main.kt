@@ -256,7 +256,7 @@ internal fun LibraryApp(
 
     fun openUrl(url: String) {
         launchExternal {
-            require(FanboxLinks.isOfficialUrl(url)) { "FANBOX 공식 주소를 입력하세요." }
+            require(FanboxLinks.isOfficialUrl(url) || FanboxLinks.isPatreonUrl(url)) { "공식 FANBOX 또는 Patreon 게시물 주소를 입력하세요." }
             Desktop.getDesktop().browse(URI(url))
         }
     }
@@ -549,6 +549,24 @@ internal fun LibraryApp(
                         },
                         openZip = { asset -> activeZipAsset = asset },
                         openPsd = { asset -> activePsdTarget = File(asset.path) to asset.name },
+                        unpackPdf = { asset ->
+                            val loaded = store ?: return@PostReader
+                            if (busy.isNotEmpty()) return@PostReader
+                            busy = "PDF 만화 페이지 변환 준비 중…"
+                            scope.launch {
+                                try {
+                                    val rep = ExternalRewardDownloader.unpackExistingPdfAsset(loaded, currentPost, asset) { msg ->
+                                        busy = msg
+                                    }
+                                    posts = withContext(Dispatchers.IO) { loaded.posts() }
+                                    notice = Notice("PDF 페이지 변환 완료 · 추가 ${rep.added}장 · 기존 ${rep.reused}장", rep.warnings)
+                                } catch (e: Exception) {
+                                    notice = Notice("PDF 변환 실패: " + (e.localizedMessage ?: e.javaClass.simpleName))
+                                } finally {
+                                    busy = ""
+                                }
+                            }
+                        },
                         onDeleteAsset = { asset ->
                             val loaded = store ?: return@PostReader
                             scope.launch {

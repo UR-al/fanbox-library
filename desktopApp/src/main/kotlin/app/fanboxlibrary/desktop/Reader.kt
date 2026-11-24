@@ -154,6 +154,7 @@ internal fun PostReader(
     export: (LibraryAsset) -> Unit,
     openZip: (LibraryAsset) -> Unit = {},
     openPsd: (LibraryAsset) -> Unit = {},
+    unpackPdf: (LibraryAsset) -> Unit = {},
     onDeleteAsset: (LibraryAsset) -> Unit = {},
 ) {
     val colors = LocalGalleryColors.current
@@ -345,6 +346,7 @@ internal fun PostReader(
                     export = export,
                     openZip = openZip,
                     openPsd = openPsd,
+                    unpackPdf = unpackPdf,
                     onDelete = { pendingDelete = it },
                 )
             }
@@ -984,6 +986,7 @@ private fun ColumnScope.AttachmentsPane(
     export: (LibraryAsset) -> Unit,
     openZip: (LibraryAsset) -> Unit,
     openPsd: (LibraryAsset) -> Unit,
+    unpackPdf: (LibraryAsset) -> Unit,
     onDelete: (LibraryAsset) -> Unit,
 ) {
     val colors = LocalGalleryColors.current
@@ -1046,6 +1049,15 @@ private fun ColumnScope.AttachmentsPane(
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                     ) {
                         Text("PSD 레이어 편집")
+                    }
+                } else if (asset.name.endsWith(".pdf", ignoreCase = true)) {
+                    Button(
+                        onClick = { unpackPdf(asset) },
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = colors.accent),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    ) {
+                        Text("PDF 만화 페이지 풀기")
                     }
                 }
                 TextButton(onClick = { export(asset) }) {

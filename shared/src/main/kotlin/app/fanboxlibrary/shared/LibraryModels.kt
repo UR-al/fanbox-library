@@ -51,7 +51,7 @@ object FanboxLinks {
     private val host = Regex("""(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)?fanbox\.cc""")
     private val postPath = Regex("""(?:/@[A-Za-z0-9_-]+)?/posts/([1-9][0-9]{0,18})/?""")
     private val patreonHost = Regex("""(?:www\.)?patreon\.com""")
-    private val patreonPostPath = Regex("""/posts/(?:[^/]*-)?([1-9][0-9]{0,18})/?""")
+    private val patreonPostPath = Regex("""(?:/(?:c/)?[A-Za-z0-9_-]+)?/posts/(?:[^/]*-)?([1-9][0-9]{0,18})/?""")
 
     private fun official(raw: String): URI? {
         val uri = runCatching { URI(raw.trim()) }.getOrNull() ?: return null

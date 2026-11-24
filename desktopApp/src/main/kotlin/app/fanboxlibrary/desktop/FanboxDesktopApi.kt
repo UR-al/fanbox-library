@@ -118,12 +118,27 @@ internal data class DesktopFanboxPostSummary(
     val uniqueKey: String get() = "${service.name}:$id"
 }
 
+internal enum class ExternalLinkKind(val badge: String) {
+    DROPBOX("Dropbox"),
+    GOOGLE_DRIVE("Google Drive"),
+    MEGA("MEGA"),
+    DIRECT_FILE("직접 파일"),
+    PATREON_GATE("보상 인증 페이지"),
+}
+
+internal data class DesktopPostExternalLink(
+    val label: String,
+    val url: String,
+    val kind: ExternalLinkKind = ExternalRewardDownloader.classifyUrl(url),
+)
+
 internal data class DesktopFanboxPostDetail(
     val summary: DesktopFanboxPostSummary,
     val text: String,
     val images: List<DesktopFanboxImage>,
     val files: List<DesktopFanboxFile>,
     val tags: List<String>,
+    val externalLinks: List<DesktopPostExternalLink> = emptyList(),
 )
 
 internal data class DesktopFanboxFeedPage(
@@ -580,7 +595,9 @@ internal object DesktopFanboxClient {
                 if (keyStr.isNotEmpty() && seenFile.add(keyStr)) (v as? Map<*, *>)?.toFile()?.let(files::add)
             }
         }
-        return DesktopFanboxPostDetail(summary, textParts.joinToString("\n\n"), images, files, tags)
+        val fullText = textParts.joinToString("\n\n")
+        val extLinks = ExternalRewardDownloader.extractBareUrlsFromText(fullText)
+        return DesktopFanboxPostDetail(summary, fullText, images, files, tags, extLinks)
     }
 
     private fun Map<*, *>.toImage(): DesktopFanboxImage? {

@@ -9,6 +9,12 @@ import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 import java.util.prefs.Preferences
 
+internal data class ParsedPatreonContent(
+    val text: String,
+    val links: List<DesktopPostExternalLink>,
+    val inlineImages: List<DesktopFanboxImage>,
+)
+
 internal object DesktopPatreonSession {
     private val prefs: Preferences = Preferences.userRoot().node("app/fanboxlibrary/desktop/patreon")
     const val WEB_ORIGIN = "https://www.patreon.com"
@@ -34,6 +40,9 @@ internal object DesktopPatreonSession {
 }
 
 internal object DesktopPatreonClient {
+    private const val POST_FIELDS =
+        "title,content,content_json_string,teaser_text,teaser_text_json_string,embed,published_at,url,patreon_url,post_type,post_metadata,post_file,current_user_can_view,image,min_cents_pledged_to_view,is_paid,like_count,is_nsfw"
+
     private val http = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
@@ -42,14 +51,14 @@ internal object DesktopPatreonClient {
 
     fun fetchStream(nextUrl: String? = null): DesktopFanboxResult<DesktopFanboxFeedPage> {
         val url = nextUrl?.takeIf { isAllowedPatreonUrl(it) }
-            ?: "https://www.patreon.com/api/stream?include=user,campaign,images,attachments&fields[post]=title,content,published_at,url,post_type,current_user_can_view,image,min_cents_pledged_to_view,is_paid,like_count,is_nsfw&fields[campaign]=creation_name,avatar_photo_url,url,vanity&fields[user]=full_name,image_url&page[count]=20&json-api-version=1.0"
+            ?: "https://www.patreon.com/api/stream?include=user,campaign,images,attachments&fields[post]=$POST_FIELDS&fields[campaign]=creation_name,avatar_photo_url,url,vanity&fields[user]=full_name,image_url&page[count]=20&json-api-version=1.0"
         return requestJson(url, requireAuth = true) { parseStreamPage(it) }
     }
 
     fun fetchCampaignPosts(campaignId: String, nextUrl: String? = null): DesktopFanboxResult<DesktopFanboxFeedPage> {
         val cid = URLEncoder.encode(campaignId, "UTF-8")
         val url = nextUrl?.takeIf { isAllowedPatreonUrl(it) }
-            ?: "https://www.patreon.com/api/posts?filter[campaign_id]=$cid&filter[contains_exclusive_posts]=true&sort=-published_at&include=user,campaign,images,attachments&fields[post]=title,content,published_at,url,post_type,current_user_can_view,image,min_cents_pledged_to_view,is_paid,like_count,is_nsfw&fields[campaign]=creation_name,avatar_photo_url,url,vanity&fields[user]=full_name,image_url&page[count]=20&json-api-version=1.0"
+            ?: "https://www.patreon.com/api/posts?filter[campaign_id]=$cid&filter[contains_exclusive_posts]=true&sort=-published_at&include=user,campaign,images,attachments&fields[post]=$POST_FIELDS&fields[campaign]=creation_name,avatar_photo_url,url,vanity&fields[user]=full_name,image_url&page[count]=20&json-api-version=1.0"
         return requestJson(url, requireAuth = false) { parseStreamPage(it) }
     }
 
@@ -118,45 +127,48 @@ internal object DesktopPatreonClient {
 
     fun fetchPostDetail(postId: String): DesktopFanboxResult<DesktopFanboxPostDetail> {
         val pid = URLEncoder.encode(postId, "UTF-8")
-        val url = "https://www.patreon.com/api/posts/$pid?include=attachments,images,media,user,campaign&fields[post]=title,content,published_at,url,post_type,current_user_can_view,image,min_cents_pledged_to_view,is_paid,like_count,is_nsfw&fields[media]=image_urls,download_url,file_name,size_bytes,mimetype&fields[attachment]=name,url&fields[campaign]=creation_name,avatar_photo_url,url&fields[user]=full_name,image_url&json-api-version=1.0"
+        val url = "https://www.patreon.com/api/posts/$pid?include=attachments,images,media,user,campaign&fields[post]=$POST_FIELDS&fields[media]=image_urls,download_url,file_name,size_bytes,mimetype&fields[attachment]=name,url&fields[campaign]=creation_name,avatar_photo_url,url&fields[user]=full_name,image_url&json-api-version=1.0"
         return requestJson(url, requireAuth = false) { root ->
             val data = root["data"] as? Map<*, *> ?: throw IOException("Patreon 게시글 정보를 찾을 수 없습니다.")
             val included = indexIncluded(root["included"] as? List<*>)
             val summary = parsePost(data, included) ?: throw IOException("Patreon 게시글 데이터가 비어 있습니다.")
             val attrs = data["attributes"] as? Map<*, *>
-            val contentHtml = attrs?.str("content").orEmpty()
-            val text = stripHtml(contentHtml)
+            val parsedBody = parsePatreonAttributes(attrs)
 
+            val rawImagesByMediaId = linkedMapOf<String, DesktopFanboxImage>()
             val images = mutableListOf<DesktopFanboxImage>()
             val files = mutableListOf<DesktopFanboxFile>()
             val seenUrls = hashSetOf<String>()
 
-            // 1. Collect media / images from included
+            // 1. Collect media / images / attachments from included
             val rels = data["relationships"] as? Map<*, *>
             fun collectMediaRel(relKey: String) {
                 val relList = ((rels?.get(relKey) as? Map<*, *>)?.get("data") as? List<*>).orEmpty()
                 relList.forEachIndexed { idx, ref ->
                     val r = ref as? Map<*, *> ?: return@forEachIndexed
-                    val obj = included["${r.str("type")}:${r.str("id")}"] ?: return@forEachIndexed
+                    val mediaId = r.str("id")
+                    val obj = included["${r.str("type")}:$mediaId"] ?: return@forEachIndexed
                     val ma = obj["attributes"] as? Map<*, *> ?: return@forEachIndexed
                     val mime = ma.str("mimetype")
                     val imgUrls = ma["image_urls"] as? Map<*, *>
                     val origUrl = imgUrls?.optStr("original")
-                        ?: imgUrls?.optStr("default")
                         ?: ma.optStr("download_url")
+                        ?: imgUrls?.optStr("default")
                         ?: ma.optStr("url")
                     val thumbUrl = imgUrls?.optStr("default_small") ?: imgUrls?.optStr("default") ?: origUrl
-                    val fileName = ma.str("file_name").ifBlank { ma.str("name").ifBlank { "patreon_${r.str("id")}" } }
+                    val fileName = ma.str("file_name").ifBlank { ma.str("name").ifBlank { "patreon_$mediaId" } }
                     val size = ma.longVal("size_bytes")
                     if (origUrl != null && seenUrls.add(origUrl)) {
                         val isImage = mime.startsWith("image/", true) || imgUrls != null ||
                             fileName.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "png", "webp", "gif")
                         if (isImage) {
-                            val ext = fileName.substringAfterLast('.', "png").takeIf { it.length in 2..5 } ?: "png"
-                            images.add(DesktopFanboxImage("${r.str("id")}_$idx", ext, 0, 0, origUrl, thumbUrl ?: origUrl))
+                            val ext = fileName.substringAfterLast('.', "png").substringBefore('?').takeIf { it.length in 2..5 } ?: "png"
+                            val img = DesktopFanboxImage("${mediaId}_$idx", ext, 0, 0, origUrl, thumbUrl ?: origUrl)
+                            rawImagesByMediaId[mediaId] = img
+                            images.add(img)
                         } else {
                             val ext = fileName.substringAfterLast('.', "").takeIf { it.length in 1..6 }.orEmpty()
-                            files.add(DesktopFanboxFile(r.str("id"), fileName, ext, size, origUrl))
+                            files.add(DesktopFanboxFile(mediaId, fileName, ext, size, origUrl))
                         }
                     }
                 }
@@ -165,16 +177,248 @@ internal object DesktopPatreonClient {
             collectMediaRel("media")
             collectMediaRel("attachments")
 
-            // 2. Cover image fallback if images list is empty
+            // Honor post_metadata.image_order if Patreon specifies exact page order
+            val imageOrder = ((attrs?.get("post_metadata") as? Map<*, *>)?.get("image_order") as? List<*>)
+                ?.mapNotNull { it?.toString()?.trim()?.takeIf(String::isNotEmpty) }
+                .orEmpty()
+            if (imageOrder.isNotEmpty() && rawImagesByMediaId.isNotEmpty()) {
+                val ordered = mutableListOf<DesktopFanboxImage>()
+                val used = hashSetOf<DesktopFanboxImage>()
+                for (mid in imageOrder) {
+                    val found = rawImagesByMediaId[mid] ?: continue
+                    if (used.add(found)) ordered.add(found)
+                }
+                for (rem in images) {
+                    if (used.add(rem)) ordered.add(rem)
+                }
+                images.clear()
+                images.addAll(ordered)
+            }
+
+            // Include inline ProseMirror images if not already present
+            for (inlineImg in parsedBody.inlineImages) {
+                val mid = inlineImg.id.removePrefix("inline_")
+                if (mid !in rawImagesByMediaId && seenUrls.add(inlineImg.originalUrl)) {
+                    images.add(inlineImg)
+                }
+            }
+
+            // 2. Cover / post_file fallback if images list is still empty
             if (images.isEmpty()) {
+                val postFileObj = attrs?.get("post_file") as? Map<*, *>
                 val coverObj = attrs?.get("image") as? Map<*, *>
-                val coverUrl = coverObj?.optStr("large_url") ?: coverObj?.optStr("url")
+                val coverUrl = postFileObj?.optStr("url") ?: coverObj?.optStr("large_url") ?: coverObj?.optStr("url")
                 if (coverUrl != null && seenUrls.add(coverUrl)) {
                     images.add(DesktopFanboxImage("cover_${summary.id}", "jpg", 0, 0, coverUrl, coverUrl))
                 }
             }
 
-            DesktopFanboxPostDetail(summary, text, images, files, summary.tags)
+            DesktopFanboxPostDetail(
+                summary = summary,
+                text = parsedBody.text,
+                images = images,
+                files = files,
+                tags = summary.tags,
+                externalLinks = parsedBody.links,
+            )
+        }
+    }
+
+    internal fun parsePatreonAttributes(attrs: Map<*, *>?): ParsedPatreonContent {
+        if (attrs == null) return ParsedPatreonContent("", emptyList(), emptyList())
+        val links = linkedMapOf<String, DesktopPostExternalLink>()
+        val inlineImages = mutableListOf<DesktopFanboxImage>()
+
+        fun recordLink(label: String, rawHref: String) {
+            val cleaned = ExternalRewardDownloader.cleanExtractedUrl(rawHref) ?: return
+            if (!ExternalRewardDownloader.isInterestingExternalPostLink(cleaned)) return
+            val niceLabel = label.trim()
+                .takeIf { it.isNotEmpty() && !it.equals(cleaned, ignoreCase = true) && !it.startsWith("http", ignoreCase = true) }
+                ?: ExternalRewardDownloader.defaultLabelForUrl(cleaned)
+            val existing = links[cleaned]
+            if (existing == null || existing.label == ExternalRewardDownloader.defaultLabelForUrl(cleaned)) {
+                links[cleaned] = DesktopPostExternalLink(niceLabel, cleaned)
+            }
+        }
+
+        // 1. Modern Patreon ProseMirror content_json_string (used by 2025-2026 Patreon editor)
+        val cjs = attrs.optStr("content_json_string") ?: attrs.optStr("teaser_text_json_string")
+        var text = ""
+        if (!cjs.isNullOrBlank()) {
+            val pm = parseProseMirrorJson(cjs, ::recordLink, inlineImages)
+            if (pm.isNotBlank()) text = pm
+        }
+
+        // 2. Legacy HTML content fallback
+        val html = attrs.optStr("content").orEmpty()
+        if (html.isNotBlank()) {
+            extractHtmlAnchors(html, ::recordLink)
+            if (text.isBlank()) text = stripHtml(html)
+        }
+
+        // 3. Teaser text fallback
+        if (text.isBlank()) {
+            text = stripHtml(attrs.str("teaser_text"))
+        }
+
+        // 4. Embed link (if post is a link/embed post)
+        val embed = attrs["embed"] as? Map<*, *>
+        if (embed != null) {
+            val embedUrl = embed.optStr("url")
+            val embedSubj = embed.str("subject").ifBlank { embed.str("description") }
+            if (embedUrl != null) recordLink(embedSubj, embedUrl)
+        }
+
+        // 5. Also pick up any bare URLs inside the text
+        ExternalRewardDownloader.extractBareUrlsFromText(text).forEach { bare ->
+            recordLink(bare.label, bare.url)
+        }
+
+        return ParsedPatreonContent(text.trim(), links.values.toList(), inlineImages)
+    }
+
+    internal fun parseProseMirrorJson(
+        jsonString: String,
+        onLink: (label: String, href: String) -> Unit = { _, _ -> },
+        inlineImages: MutableList<DesktopFanboxImage> = mutableListOf(),
+    ): String {
+        val root = runCatching { SimpleJson.parse(jsonString) as? Map<*, *> }.getOrNull() ?: return ""
+        val blocks = mutableListOf<String>()
+        var lastHeading = ""
+
+        fun renderInline(nodes: List<*>?): String {
+            if (nodes.isNullOrEmpty()) return ""
+            val sb = StringBuilder()
+            for (item in nodes) {
+                val n = item as? Map<*, *> ?: continue
+                when (n.str("type")) {
+                    "text" -> {
+                        val t = n.str("text")
+                        sb.append(t)
+                        val marks = n["marks"] as? List<*>
+                        marks?.forEach { m ->
+                            val mark = m as? Map<*, *> ?: return@forEach
+                            if (mark.str("type") == "link") {
+                                val href = (mark["attrs"] as? Map<*, *>)?.optStr("href")
+                                if (!href.isNullOrBlank()) {
+                                    val candidateLabel = t.trim().takeIf {
+                                        it.isNotEmpty() && !it.startsWith("http", ignoreCase = true) &&
+                                            !it.equals("link", ignoreCase = true) && !it.equals("link:", ignoreCase = true)
+                                    } ?: lastHeading.takeIf {
+                                        it.isNotEmpty() && !it.equals("link", ignoreCase = true) && !it.equals("link:", ignoreCase = true)
+                                    }.orEmpty()
+                                    onLink(candidateLabel, href)
+                                    if (!t.contains("http", ignoreCase = true)) {
+                                        sb.append(" ($href)")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "hardBreak" -> sb.append('\n')
+                    else -> {
+                        val nested = n["content"] as? List<*>
+                        if (nested != null) sb.append(renderInline(nested))
+                    }
+                }
+            }
+            return sb.toString()
+        }
+
+        fun visitBlock(node: Map<*, *>, listPrefix: String = "") {
+            when (node.str("type")) {
+                "doc" -> (node["content"] as? List<*>)?.forEach { (it as? Map<*, *>)?.let { child -> visitBlock(child) } }
+                "heading" -> {
+                    val line = renderInline(node["content"] as? List<*>).trim()
+                    if (line.isNotEmpty()) {
+                        if (!line.startsWith("http", ignoreCase = true)) lastHeading = line.trimEnd(':').trim()
+                        blocks.add(line)
+                    }
+                }
+                "paragraph" -> {
+                    val line = renderInline(node["content"] as? List<*>).trim()
+                    if (line.isNotEmpty()) {
+                        blocks.add(if (listPrefix.isNotEmpty()) "$listPrefix$line" else line)
+                    }
+                }
+                "blockquote" -> {
+                    val before = blocks.size
+                    (node["content"] as? List<*>)?.forEach { (it as? Map<*, *>)?.let { child -> visitBlock(child, "│ ") } }
+                    if (blocks.size == before) {
+                        val line = renderInline(node["content"] as? List<*>).trim()
+                        if (line.isNotEmpty()) blocks.add("│ $line")
+                    }
+                }
+                "bulletList" -> {
+                    val items = mutableListOf<String>()
+                    (node["content"] as? List<*>)?.forEach { li ->
+                        val liMap = li as? Map<*, *> ?: return@forEach
+                        val subLines = mutableListOf<String>()
+                        (liMap["content"] as? List<*>)?.forEach { p ->
+                            val pMap = p as? Map<*, *> ?: return@forEach
+                            val txt = renderInline(pMap["content"] as? List<*>).trim()
+                            if (txt.isNotEmpty()) subLines.add(txt)
+                        }
+                        if (subLines.isNotEmpty()) items.add("• " + subLines.joinToString("\n  "))
+                    }
+                    if (items.isNotEmpty()) blocks.add(items.joinToString("\n"))
+                }
+                "orderedList" -> {
+                    val items = mutableListOf<String>()
+                    var idx = 1
+                    (node["content"] as? List<*>)?.forEach { li ->
+                        val liMap = li as? Map<*, *> ?: return@forEach
+                        val subLines = mutableListOf<String>()
+                        (liMap["content"] as? List<*>)?.forEach { p ->
+                            val pMap = p as? Map<*, *> ?: return@forEach
+                            val txt = renderInline(pMap["content"] as? List<*>).trim()
+                            if (txt.isNotEmpty()) subLines.add(txt)
+                        }
+                        if (subLines.isNotEmpty()) items.add("${idx++}. " + subLines.joinToString("\n   "))
+                    }
+                    if (items.isNotEmpty()) blocks.add(items.joinToString("\n"))
+                }
+                "horizontalRule" -> blocks.add("───────────────")
+                "image" -> {
+                    val ia = node["attrs"] as? Map<*, *>
+                    val src = ia?.optStr("src")
+                    val mediaId = ia?.optStr("media_id").orEmpty()
+                    if (!src.isNullOrBlank()) {
+                        val ext = src.substringBefore('?').substringAfterLast('.', "png").takeIf { it.length in 2..5 } ?: "png"
+                        inlineImages.add(
+                            DesktopFanboxImage(
+                                id = if (mediaId.isNotEmpty()) "inline_$mediaId" else "inline_${inlineImages.size + 1}",
+                                extension = ext,
+                                width = ia.intVal("media_width"),
+                                height = ia.intVal("media_height"),
+                                originalUrl = src,
+                                thumbnailUrl = src,
+                            ),
+                        )
+                    }
+                    val linkHref = ia?.optStr("link")
+                    if (!linkHref.isNullOrBlank()) onLink(ia.str("caption").ifBlank { lastHeading }, linkHref)
+                }
+                else -> {
+                    val children = node["content"] as? List<*>
+                    if (children != null) {
+                        val inline = renderInline(children).trim()
+                        if (inline.isNotEmpty()) blocks.add(inline)
+                    }
+                }
+            }
+        }
+
+        visitBlock(root)
+        return blocks.joinToString("\n\n").replace("\u00A0", " ").trim()
+    }
+
+    private fun extractHtmlAnchors(html: String, onLink: (String, String) -> Unit) {
+        val regex = Regex("""<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        for (m in regex.findAll(html)) {
+            val href = m.groupValues[1]
+            val inner = stripHtml(m.groupValues[2])
+            onLink(inner, href)
         }
     }
 
@@ -268,14 +512,15 @@ internal object DesktopPatreonClient {
         val imgObj = attrs["image"] as? Map<*, *>
         val cover = imgObj?.optStr("large_url") ?: imgObj?.optStr("thumb_url") ?: imgObj?.optStr("url")
         val canView = (attrs["current_user_can_view"] as? Boolean) ?: true
+        val parsed = parsePatreonAttributes(attrs)
         val postType = attrs.str("post_type").ifBlank { if (cover != null) "image_file" else "text_only" }
-        val normalizedType = if (postType.contains("text", true) && cover == null) "text" else "image"
-        val rawUrl = attrs.str("url").let { u ->
-            when {
-                u.startsWith("https://") -> u
-                u.startsWith("/") -> "https://www.patreon.com$u"
-                else -> "https://www.patreon.com/posts/$id"
-            }
+        val hasExternalReward = parsed.links.isNotEmpty()
+        val normalizedType = if (postType.contains("text", true) && cover == null && !hasExternalReward) "text" else "image"
+        val urlCandidate = attrs.str("url").ifBlank { attrs.str("patreon_url") }
+        val rawUrl = when {
+            urlCandidate.startsWith("https://") -> urlCandidate
+            urlCandidate.startsWith("/") -> "https://www.patreon.com$urlCandidate"
+            else -> "https://www.patreon.com/posts/$id"
         }
         val minCents = attrs.intVal("min_cents_pledged_to_view")
 
@@ -286,7 +531,7 @@ internal object DesktopPatreonClient {
             creatorName = creatorName,
             creatorIconUrl = creatorIcon,
             coverImageUrl = cover,
-            excerpt = stripHtml(attrs.str("content")).take(140),
+            excerpt = parsed.text.replace(Regex("\\s+"), " ").take(160),
             publishedDatetime = attrs.str("published_at"),
             feeRequired = minCents / 100,
             isRestricted = !canView,
@@ -298,16 +543,24 @@ internal object DesktopPatreonClient {
         )
     }
 
-    private fun stripHtml(html: String): String =
+    internal fun stripHtml(html: String): String =
         html.replace(Regex("<br\\s*/?>", RegexOption.IGNORE_CASE), "\n")
-            .replace(Regex("</p>", RegexOption.IGNORE_CASE), "\n")
+            .replace(Regex("</p>", RegexOption.IGNORE_CASE), "\n\n")
+            .replace(Regex("</h[1-6]>", RegexOption.IGNORE_CASE), "\n\n")
+            .replace(Regex("<li[^>]*>", RegexOption.IGNORE_CASE), "• ")
+            .replace(Regex("</li>", RegexOption.IGNORE_CASE), "\n")
             .replace(Regex("<[^>]+>"), "")
             .replace("&amp;", "&")
+            .replace("&#038;", "&")
             .replace("&lt;", "<")
             .replace("&gt;", ">")
             .replace("&quot;", "\"")
             .replace("&#39;", "'")
+            .replace("&#8217;", "’")
+            .replace("&#8220;", "“")
+            .replace("&#8221;", "”")
             .replace("&nbsp;", " ")
+            .replace(Regex("\n{3,}"), "\n\n")
             .trim()
 
     private fun isAllowedPatreonUrl(url: String): Boolean {

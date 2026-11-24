@@ -4,6 +4,9 @@ import androidx.compose.ui.graphics.toAwtImage
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.test.*
 import app.fanboxlibrary.shared.*
+import org.apache.pdfbox.pdmodel.PDDocument
+import org.apache.pdfbox.pdmodel.PDPage
+import org.apache.pdfbox.pdmodel.PDPageContentStream
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
@@ -126,5 +129,95 @@ class DesktopLibraryTest {
         target.writeText("keep")
         assertThrows(IllegalArgumentException::class.java) { exportLibraryFile(asset, target) }
         assertEquals("keep", target.readText())
+    }
+
+    @Test fun patreonProseMirrorAndExternalDropboxGateParsingWorks() {
+        // 1. Creator-prefixed Patreon URLs must parse post ID and import cleanly into LibraryStore
+        assertEquals("174853749", FanboxLinks.patreonPostId("https://www.patreon.com/robokeh/posts/my-affair-with-3-174853749"))
+        assertEquals("174853749", FanboxLinks.patreonPostId("https://www.patreon.com/c/robokeh/posts/174853749"))
+        assertEquals("174853749", FanboxLinks.patreonPostId("https://www.patreon.com/posts/my-affair-with-3-174853749"))
+
+        val lib = LibraryStore(temporary.newFolder("patreon-lib"))
+        lib.importManaged(
+            PostDraft(
+                creator = "Robokeh",
+                title = "My Affair With Kotaro",
+                year = 2026,
+                sourceUrl = "https://www.patreon.com/robokeh/posts/my-affair-with-3-174853749",
+            ),
+            listOf(ImportSource("01.png") { picture(Color.CYAN).inputStream() }),
+        )
+        assertEquals("patreon:174853749", lib.posts().single().id)
+
+        // 2. ProseMirror content_json_string extracts readable text, bullet list, and external gate link
+        val proseMirrorJson = """
+            {"type":"doc","content":[
+              {"type":"paragraph","content":[{"type":"text","text":"Hello dear Patrons!"}]},
+              {"type":"bulletList","content":[
+                {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"Zoro x Laxus"}]}]},
+                {"type":"listItem","content":[{"type":"paragraph","content":[{"type":"text","text":"Mash x Natsu"}]}]}
+              ]},
+              {"type":"heading","attrs":{"level":3},"content":[{"type":"text","text":"HD Comic Reward"}]},
+              {"type":"heading","attrs":{"level":1},"content":[
+                {"type":"text","marks":[{"type":"link","attrs":{"href":"https://robokeh.org/my-affair-with-kotaro-comic-hd-link/"}}],"text":"https://robokeh.org/my-affair-with-kotaro-comic-hd-link/"}
+              ]}
+            ]}
+        """.trimIndent()
+        val parsed = DesktopPatreonClient.parsePatreonAttributes(
+            mapOf("content" to null, "content_json_string" to proseMirrorJson),
+        )
+        assertTrue(parsed.text.contains("Hello dear Patrons!"))
+        assertTrue(parsed.text.contains("• Zoro x Laxus"))
+        assertEquals(1, parsed.links.size)
+        assertEquals("https://robokeh.org/my-affair-with-kotaro-comic-hd-link/", parsed.links.single().url)
+        assertEquals(ExternalLinkKind.PATREON_GATE, parsed.links.single().kind)
+
+        // 3. Dropbox dl=1 normalization preserves rlkey & st tokens and decodes HTML &#038;
+        val normalized = ExternalRewardDownloader.normalizeDirectDownloadUrl(
+            "https://www.dropbox.com/scl/fo/abc123xyz/h?rlkey=mySecretKey&#038;st=tok99&amp;dl=0",
+        )
+        assertEquals("https://www.dropbox.com/scl/fo/abc123xyz/h?rlkey=mySecretKey&st=tok99&dl=1", normalized)
+
+        // 4. WordPress patreon-connect locked & unlocked HTML parsing
+        val lockedHtml = """
+            <div>
+              <a href="https://robokeh.org/patreon-flow/?patreon-unlock-post=148">Unlock with Patreon</a>
+            </div>
+        """.trimIndent()
+        val lockedAnalysis = ExternalRewardDownloader.parseGateHtml("https://robokeh.org/my-affair/", lockedHtml)
+        assertTrue(lockedAnalysis.rewards.isEmpty())
+        assertEquals("https://robokeh.org/patreon-flow/?patreon-unlock-post=148", lockedAnalysis.patreonUnlockUrl)
+
+        val unlockedHtml = """
+            <h3>September Sketch Pack</h3>
+            <p><a href="https://www.dropbox.com/scl/fo/sketch111/h?rlkey=k1&#038;dl=0">Download</a></p>
+            <h3>Kotaro Part 1 PSD + Textless</h3>
+            <p><a href="https://www.dropbox.com/scl/fo/psd222/h?rlkey=k2&amp;dl=0">Dropbox</a></p>
+        """.trimIndent()
+        val unlockedAnalysis = ExternalRewardDownloader.parseGateHtml("https://robokeh.org/deluxe/", unlockedHtml)
+        assertEquals(2, unlockedAnalysis.rewards.size)
+        assertTrue(unlockedAnalysis.rewards[0].label.contains("September Sketch Pack"))
+        assertEquals("https://www.dropbox.com/scl/fo/sketch111/h?rlkey=k1&dl=1", unlockedAnalysis.rewards[0].directDownloadUrl)
+        assertTrue(unlockedAnalysis.rewards[1].label.contains("Kotaro Part 1 PSD"))
+        assertEquals("https://www.dropbox.com/scl/fo/psd222/h?rlkey=k2&dl=1", unlockedAnalysis.rewards[1].directDownloadUrl)
+
+        // 5. Multi-page PDF renders cleanly into comic page JPEGs
+        val pdfFile = File(temporary.root, "sample_comic.pdf")
+        PDDocument().use { doc ->
+            repeat(2) { idx ->
+                val page = PDPage()
+                doc.addPage(page)
+                PDPageContentStream(doc, page).use { cs ->
+                    cs.setNonStrokingColor(if (idx == 0) Color.BLUE else Color.RED)
+                    cs.addRect(50f, 50f, 300f, 400f)
+                    cs.fill()
+                }
+            }
+            doc.save(pdfFile)
+        }
+        val outDir = temporary.newFolder("pdf-pages")
+        val rendered = ExternalRewardDownloader.renderPdfPagesToJpeg(pdfFile, "sample_comic", outDir) {}
+        assertEquals(2, rendered.size)
+        assertTrue(rendered.all { it.isFile && it.length() > 1000 })
     }
 }
